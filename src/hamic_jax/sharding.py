@@ -104,9 +104,13 @@ def device_label() -> str:
     backend = jax.default_backend()
     kind = str(devices[0].device_kind) if devices else backend
     if backend == "tpu":
-        match = re.search(r"v\d+[a-z]?", kind.lower())
-        if match is not None:
-            return f"{match.group(0)}-{len(devices)}"
+        lowered = kind.lower()
+        # JAX reports the v5e and v6e chips as "TPU v5 lite" and "TPU v6 lite".
+        name = "v5e" if "v5 lite" in lowered else "v6e" if "v6 lite" in lowered else None
+        if name is None:
+            match = re.search(r"v\d+[a-z]?", lowered)
+            name = match.group(0) if match is not None else "tpu"
+        return f"{name}-{len(devices)}"
     return f"{backend}-{len(devices)}"
 
 
