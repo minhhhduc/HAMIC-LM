@@ -21,20 +21,15 @@ from hamic_jax.model import forward
 from hamic_jax.objectives import CLMObjective, MLMObjective, MaskedBatch
 from hamic_jax.optim import build_optimizer
 from hamic_jax.params import init_params
+from hamic_jax.sharding import DeviceLayout
 from hamic_jax.spec import Architecture, ModelPreset, TrainingConfig
 
-__all__ = ["TrainState", "Trainer", "evaluate"]
+__all__ = ["TrainState", "Trainer", "evaluate", "evaluate_metrics"]
 
 Array = jax.Array
 
 # Validation masks each batch with a distinct, run-independent seed, as the oracle does.
 _EVAL_SEED_OFFSET = 1 << 40
-
-_eval_forward = jax.jit(
-    forward,
-    static_argnums=(1,),
-    static_argnames=("document_mask", "objective"),
-)
 
 
 @dataclass
@@ -87,11 +82,13 @@ class Trainer:
             shuffle=config.shuffle,
             source_weights=dict(config.source_weights) or None,
         )
+        self.layout = DeviceLayout.for_batch(config.micro_batch_size)
         key = jax.random.PRNGKey(config.seed)
         master = init_params(preset, key, dtype=jnp.float32) if params is None else params
-        self.params = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), master)
+        master = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype=jnp.float32), master)
+        self.params = self.layout.replicate(master)
         self.optimizer = build_optimizer(config, self.params)
-        self.optimizer_state = self.optimizer.init(self.params)
+        self.optimizer_state = self.layout.replicate(self.optimizer.init(self.params))
         self.step = 0
         self.objective: MLMObjective | CLMObjective
         if config.objective == "mlm":
@@ -173,10 +170,13 @@ class Trainer:
             self.objective = CLMObjective()
         self._step_fn = self._build_step()
 
-    def _build_step(self) -> Callable[..., tuple[dict[str, Array], Any, Array]]:
+    def _build_step(
+        self,
+    ) -> Callable[..., tuple[dict[str, Array], Any, Array, Array]]:
         optimizer = self.optimizer
         preset = self.preset
         config = self.config
+        layout = self.layout
 
         def loss_fn(
             params: dict[str, Array], input_ids: Array, labels: Array
@@ -188,6 +188,8 @@ class Trainer:
                 labels,
                 document_mask=not config.cross_document_attention,
                 objective=config.objective,
+                attention_impl=config.attention,
+                recompute=config.recompute,
             )
             assert output.loss is not None
             return output.loss
@@ -197,7 +199,7 @@ class Trainer:
             optimizer_state: Any,
             input_ids: Array,
             labels: Array,
-        ) -> tuple[dict[str, Array], Any, Array]:
+        ) -> tuple[dict[str, Array], Any, Array, Array]:
             compute = jax.tree.map(lambda leaf: leaf.astype(self.dtype), params)
 
             def body(
@@ -212,19 +214,48 @@ class Trainer:
 
             zeros = jax.tree.map(jnp.zeros_like, params)
             grad_sum, losses = jax.lax.scan(body, zeros, (input_ids, labels))
-            mean_loss = jnp.mean(losses)
+            # Every chip must apply the same global-batch gradient. The gradients are
+            # already the sum over the local shard, so an average over chips gives the
+            # gradient of the mean loss over the full batch.
+            grad_sum = jax.tree.map(
+                lambda value: jax.lax.pmean(value, "data"),
+                grad_sum,
+            )
+            mean_loss = jax.lax.pmean(jnp.mean(losses), "data")
             mean_grads = jax.tree.map(
                 lambda value: value.astype(jnp.float32)
                 / max(1, config.grad_accum_steps),
                 grad_sum,
             )
+            norm = jnp.sqrt(
+                sum(
+                    jnp.sum(jnp.square(value))
+                    for value in jax.tree.leaves(mean_grads)
+                )
+            )
             updates, new_optimizer_state = optimizer.update(
                 mean_grads, optimizer_state, params
             )
             new_params = optax.apply_updates(params, updates)
-            return new_params, new_optimizer_state, mean_loss
+            return new_params, new_optimizer_state, mean_loss, norm
 
-        return jax.jit(step, donate_argnums=(0, 1, 2, 3))
+        mapped = jax.shard_map(
+            step,
+            mesh=layout.mesh,
+            in_specs=(
+                layout.replicated_spec(self.params),
+                layout.replicated_spec(self.optimizer_state),
+                layout.stack_sharding.spec,
+                layout.stack_sharding.spec,
+            ),
+            out_specs=(
+                layout.replicated_spec(self.params),
+                layout.replicated_spec(self.optimizer_state),
+                layout.param_sharding.spec,
+                layout.param_sharding.spec,
+            ),
+        )
+        return jax.jit(mapped, donate_argnums=(0, 1, 2, 3))
 
     def _micro_batches(self) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]:
         ids_rows = []
@@ -238,19 +269,37 @@ class Trainer:
             label_rows.append(masked.labels)
         return np.stack(ids_rows), np.stack(label_rows)
 
-    def train_step(self) -> Array:
-        """Run one optimizer step and return its mean loss as a device scalar."""
+    def train_step_metrics(self) -> tuple[Array, Array]:
+        """Run one optimizer step and return ``(loss, gradient_norm)`` device scalars.
+
+        Neither scalar is synchronised here. Callers that log every step can read both
+        once at the end of a log window, which keeps the TPU queue full.
+        """
         ids, labels = self._micro_batches()
-        new_params, new_optimizer_state, loss = self._step_fn(
+        new_params, new_optimizer_state, loss, norm = self._step_fn(
             self.params,
             self.optimizer_state,
-            jnp.asarray(ids, dtype=jnp.int32),
-            jnp.asarray(labels, dtype=jnp.int32),
+            self.layout.place_stack(ids),
+            self.layout.place_stack(labels),
         )
         self.params = new_params
         self.optimizer_state = new_optimizer_state
         self.step += 1
+        return loss, norm
+
+    def train_step(self) -> Array:
+        """Run one optimizer step and return its mean loss as a device scalar."""
+        loss, _ = self.train_step_metrics()
         return loss
+
+    def restore(self, params: Any, optimizer_state: Any) -> None:
+        """Replace the state after loading a checkpoint on a different device layout."""
+        master = jax.tree.map(
+            lambda leaf: jnp.asarray(leaf, dtype=jnp.float32),
+            params,
+        )
+        self.params = self.layout.replicate(master)
+        self.optimizer_state = self.layout.replicate(optimizer_state)
 
     def train(self, steps: int, callback: Callable[[int, float], None] | None = None) -> None:
         """Run up to ``steps`` optimizer steps."""
@@ -275,7 +324,7 @@ class Trainer:
         )
 
 
-def evaluate(
+def evaluate_metrics(
     config: TrainingConfig,
     preset: ModelPreset,
     corpus: TokenizedCorpus,
@@ -286,14 +335,21 @@ def evaluate(
     masking: str | None = None,
     mask_rate: float | None = None,
     pmi_pairs: np.ndarray[Any, Any] | None = None,
-) -> float:
-    """Mean validation loss over a deterministic prefix of the validation split.
+) -> tuple[float, float | None]:
+    """Mean validation loss and, for causal LM, bits per byte.
 
     ``masking`` selects the MLM view (``token``, ``span`` or ``pmi``). Eval notebooks
     pass all three against the same parameters; the training objective is unchanged.
+
+    The loss is the token-weighted mean over every batch: each shard contributes its
+    local sum and valid-token count through ``psum``, so splitting the batch over chips
+    does not change the reported number. Bits per byte additionally needs the byte
+    length of each target token. It is only available for causal LM with a byte-level
+    tokenizer next to the shards; MLM targets have no single next-token byte count.
     """
     count = sequences or config.eval_sequences
     batch = batch_size or config.micro_batch_size
+    layout = DeviceLayout.for_batch(batch)
     batches = PackedBatches(
         corpus,
         "validation",
@@ -320,25 +376,116 @@ def evaluate(
         if masking not in (None, "token"):
             raise ValueError("masking views only apply to the MLM objective")
         objective = CLMObjective()
-    losses: list[float] = []
+    byte_table: Array | None = None
+    if config.objective == "clm":
+        try:
+            byte_table = layout.replicate(
+                jnp.asarray(corpus.token_byte_lengths(), dtype=jnp.float32)
+            )
+        except (FileNotFoundError, KeyError, ValueError):
+            byte_table = None
     dtype = jnp.bfloat16 if config.precision == "bf16" else jnp.float32
-    compute = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype=dtype), params)
+    compute = layout.replicate(
+        jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype=dtype), params)
+    )
 
+    def eval_step(
+        shard_params: dict[str, Array],
+        input_ids: Array,
+        labels: Array,
+    ) -> tuple[Array, Array, Array]:
+        output = forward(
+            shard_params,
+            preset,
+            input_ids,
+            labels,
+            document_mask=not config.cross_document_attention,
+            objective=config.objective,
+            attention_impl=config.attention,
+            recompute=config.recompute,
+        )
+        assert output.loss is not None
+        targets = labels[:, 1:] if config.objective == "clm" else labels
+        valid = targets != -100
+        local_count = jnp.sum(valid.astype(jnp.float32))
+        local_nats = output.loss * local_count
+        global_nats = jax.lax.psum(local_nats, "data")
+        global_count = jax.lax.psum(local_count, "data")
+        global_loss = global_nats / jnp.maximum(global_count, 1.0)
+        if byte_table is None:
+            zero = jnp.zeros((), dtype=jnp.float32)
+            return global_loss, global_nats, zero
+        safe = jnp.where(valid, targets, 0)
+        local_bytes = jnp.sum(byte_table[safe] * valid.astype(jnp.float32))
+        return (
+            global_loss,
+            global_nats,
+            jax.lax.psum(local_bytes, "data"),
+        )
+
+    mapped = jax.shard_map(
+        eval_step,
+        mesh=layout.mesh,
+        in_specs=(
+            layout.replicated_spec(compute),
+            layout.batch_sharding.spec,
+            layout.batch_sharding.spec,
+        ),
+        out_specs=(
+            layout.param_sharding.spec,
+            layout.param_sharding.spec,
+            layout.param_sharding.spec,
+        ),
+    )
+    jitted = jax.jit(mapped)
+    losses: list[float] = []
+    nats = 0.0
+    target_bytes = 0.0
     for index in range(max(1, math.ceil(count / batch))):
         rows = batches.next_batch()
         masked = objective(rows, _EVAL_SEED_OFFSET + index)
-        output = _eval_forward(
+        loss, batch_nats, batch_bytes = jitted(
             compute,
-            preset,
-            jnp.asarray(masked.input_ids, dtype=jnp.int32),
-            jnp.asarray(masked.labels, dtype=jnp.int32),
-            document_mask=not config.cross_document_attention,
-            objective=config.objective,
+            layout.place_batch(masked.input_ids),
+            layout.place_batch(masked.labels),
         )
-        assert output.loss is not None
-        losses.append(float(output.loss))
-    return float(np.mean(losses)) if losses else float("nan")
+        losses.append(float(loss))
+        nats += float(batch_nats)
+        target_bytes += float(batch_bytes)
+    mean_loss = float(np.mean(losses)) if losses else float("nan")
+    bits_per_byte = (
+        nats / (math.log(2) * target_bytes)
+        if byte_table is not None and target_bytes > 0
+        else None
+    )
+    return mean_loss, bits_per_byte
 
+
+def evaluate(
+    config: TrainingConfig,
+    preset: ModelPreset,
+    corpus: TokenizedCorpus,
+    params: dict[str, Array],
+    sequences: int | None = None,
+    batch_size: int | None = None,
+    *,
+    masking: str | None = None,
+    mask_rate: float | None = None,
+    pmi_pairs: np.ndarray[Any, Any] | None = None,
+) -> float:
+    """Mean validation loss over a deterministic prefix of the validation split."""
+    loss, _ = evaluate_metrics(
+        config,
+        preset,
+        corpus,
+        params,
+        sequences,
+        batch_size,
+        masking=masking,
+        mask_rate=mask_rate,
+        pmi_pairs=pmi_pairs,
+    )
+    return loss
 
 def masking_views(
     config: TrainingConfig,

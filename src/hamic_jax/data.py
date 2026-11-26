@@ -156,6 +156,30 @@ class TokenizedCorpus:
             raise ValueError(f"{path} does not match the tokenizer recorded in the manifest")
         return path
 
+    def token_byte_lengths(self) -> np.ndarray[Any, Any]:
+        """UTF-8 bytes each token id decodes to (``0`` for special and added tokens).
+
+        Bits per byte is comparable across tokenizers, unlike loss per token. The
+        HAMIC tokenizers count their virtual spaces as bytes, so their bits per byte
+        read about 0.4% low against a tokenizer without virtual spaces.
+
+        Raises:
+            FileNotFoundError: The directory has no tokenizer copy.
+            ValueError: The copy does not match the manifest, or is not byte-level BPE.
+        """
+        data = json.loads(self.tokenizer_file().read_text(encoding="utf-8"))
+        decoder = data.get("decoder") or {}
+        kinds = {entry.get("type") for entry in decoder.get("decoders", [])}
+        kinds.add(decoder.get("type"))
+        if "ByteLevel" not in kinds:
+            raise ValueError("byte lengths need a byte-level tokenizer")
+        lengths = np.zeros(self.vocab_size, dtype=np.int64)
+        for token, index in data["model"]["vocab"].items():
+            lengths[index] = len(token)
+        for added in data.get("added_tokens", []):
+            lengths[added["id"]] = 0
+        return lengths
+
 
 def tokenized_prefix(path: str | Path) -> str:
     """Return the Hub prefix of a tokenized directory (``tokenized/<version>/<name>``)."""

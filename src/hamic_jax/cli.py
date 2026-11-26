@@ -61,11 +61,7 @@ def _train(args: argparse.Namespace) -> int:
         params, optimizer_state, step, cursor, _ = load_checkpoint(
             args.resume, trainer.optimizer
         )
-        trainer.params = {
-            name: jax.numpy.asarray(value, dtype=jax.numpy.float32)
-            for name, value in params.items()
-        }
-        trainer.optimizer_state = optimizer_state
+        trainer.restore(params, optimizer_state)
         trainer.step = step
         trainer.batches.restore(cursor)
     out = Path(args.out)

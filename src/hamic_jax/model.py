@@ -52,6 +52,9 @@ def encoder_hidden(
     attention_mask: Array | None = None,
     document_mask: bool = True,
     special: SpecialTokens | None = None,
+    *,
+    attention_impl: str = "xla",
+    recompute: bool = False,
 ) -> Array:
     """Return the final encoder hidden states, before the MLM head."""
     special = special or SpecialTokens()
@@ -69,23 +72,36 @@ def encoder_hidden(
     head_dim = preset.head_dim
     for layer in range(preset.num_layers):
         prefix = f"model.layers.{layer}"
-        if layer > 0:
-            attn_input = layer_norm(hidden, params[f"{prefix}.attn_norm.weight"], eps=preset.norm_eps)
-        else:
-            attn_input = hidden
-        qkv = _dense(attn_input, params[f"{prefix}.attn.Wqkv.weight"])
-        qkv = qkv.reshape(input_ids.shape[0], input_ids.shape[1], 3, heads, head_dim)
-        query, key, value = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
-        query, key = apply_rope(query, key, tables)
-        context = attention(query, key, value, mask)
-        context = context.reshape(input_ids.shape[0], input_ids.shape[1], heads * head_dim)
-        hidden = hidden + _dense(context, params[f"{prefix}.attn.Wo.weight"])
-        mlp_input = layer_norm(hidden, params[f"{prefix}.mlp_norm.weight"], eps=preset.norm_eps)
-        hidden = hidden + geglu(
-            mlp_input,
-            params[f"{prefix}.mlp.Wi.weight"],
-            params[f"{prefix}.mlp.Wo.weight"],
-        )
+
+        def block(
+            hidden: Array,
+            params: dict[str, Array],
+            prefix: str = prefix,
+            layer: int = layer,
+        ) -> Array:
+            if layer > 0:
+                attn_input = layer_norm(
+                    hidden, params[f"{prefix}.attn_norm.weight"], eps=preset.norm_eps
+                )
+            else:
+                attn_input = hidden
+            qkv = _dense(attn_input, params[f"{prefix}.attn.Wqkv.weight"])
+            qkv = qkv.reshape(input_ids.shape[0], input_ids.shape[1], 3, heads, head_dim)
+            query, key, value = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+            query, key = apply_rope(query, key, tables)
+            context = attention(query, key, value, mask, implementation=attention_impl)
+            context = context.reshape(input_ids.shape[0], input_ids.shape[1], heads * head_dim)
+            hidden = hidden + _dense(context, params[f"{prefix}.attn.Wo.weight"])
+            mlp_input = layer_norm(
+                hidden, params[f"{prefix}.mlp_norm.weight"], eps=preset.norm_eps
+            )
+            return hidden + geglu(
+                mlp_input,
+                params[f"{prefix}.mlp.Wi.weight"],
+                params[f"{prefix}.mlp.Wo.weight"],
+            )
+
+        hidden = jax.checkpoint(block)(hidden, params) if recompute else block(hidden, params)
     return layer_norm(hidden, params["model.final_norm.weight"], eps=preset.norm_eps)
 
 
@@ -96,6 +112,9 @@ def _decoder_forward(
     attention_mask: Array | None,
     document_mask: bool,
     special: SpecialTokens,
+    *,
+    attention_impl: str = "xla",
+    recompute: bool = False,
 ) -> Array:
     hidden = params["model.embed_tokens.weight"][input_ids]
     mask = decoder_mask(
@@ -111,35 +130,47 @@ def _decoder_forward(
     head_dim = preset.head_dim
     for layer in range(preset.num_layers):
         prefix = f"model.layers.{layer}"
-        attn_input = rms_norm(
-            hidden, params[f"{prefix}.input_layernorm.weight"], eps=preset.norm_eps
-        )
-        query = _dense(attn_input, params[f"{prefix}.self_attn.q_proj.weight"])
-        key = _dense(attn_input, params[f"{prefix}.self_attn.k_proj.weight"])
-        value = _dense(attn_input, params[f"{prefix}.self_attn.v_proj.weight"])
-        query = query.reshape(input_ids.shape[0], input_ids.shape[1], heads, head_dim)
-        key = key.reshape(input_ids.shape[0], input_ids.shape[1], kv_heads, head_dim)
-        value = value.reshape(input_ids.shape[0], input_ids.shape[1], kv_heads, head_dim)
-        if preset.architecture == "qwen3":
-            query = rms_norm(
-                query, params[f"{prefix}.self_attn.q_norm.weight"], eps=preset.norm_eps
+
+        def block(
+            hidden: Array,
+            params: dict[str, Array],
+            prefix: str = prefix,
+        ) -> Array:
+            attn_input = rms_norm(
+                hidden, params[f"{prefix}.input_layernorm.weight"], eps=preset.norm_eps
             )
-            key = rms_norm(key, params[f"{prefix}.self_attn.k_norm.weight"], eps=preset.norm_eps)
-        query, key = apply_rope(query, key, tables)
-        context = attention(query, key, value, mask)
-        context = context.reshape(
-            input_ids.shape[0], input_ids.shape[1], heads * head_dim
-        )
-        hidden = hidden + _dense(context, params[f"{prefix}.self_attn.o_proj.weight"])
-        mlp_input = rms_norm(
-            hidden, params[f"{prefix}.post_attention_layernorm.weight"], eps=preset.norm_eps
-        )
-        hidden = hidden + swiglu(
-            mlp_input,
-            params[f"{prefix}.mlp.gate_proj.weight"],
-            params[f"{prefix}.mlp.up_proj.weight"],
-            params[f"{prefix}.mlp.down_proj.weight"],
-        )
+            query = _dense(attn_input, params[f"{prefix}.self_attn.q_proj.weight"])
+            key = _dense(attn_input, params[f"{prefix}.self_attn.k_proj.weight"])
+            value = _dense(attn_input, params[f"{prefix}.self_attn.v_proj.weight"])
+            query = query.reshape(input_ids.shape[0], input_ids.shape[1], heads, head_dim)
+            key = key.reshape(input_ids.shape[0], input_ids.shape[1], kv_heads, head_dim)
+            value = value.reshape(input_ids.shape[0], input_ids.shape[1], kv_heads, head_dim)
+            if preset.architecture == "qwen3":
+                query = rms_norm(
+                    query, params[f"{prefix}.self_attn.q_norm.weight"], eps=preset.norm_eps
+                )
+                key = rms_norm(
+                    key, params[f"{prefix}.self_attn.k_norm.weight"], eps=preset.norm_eps
+                )
+            query, key = apply_rope(query, key, tables)
+            context = attention(query, key, value, mask, implementation=attention_impl)
+            context = context.reshape(
+                input_ids.shape[0], input_ids.shape[1], heads * head_dim
+            )
+            hidden = hidden + _dense(context, params[f"{prefix}.self_attn.o_proj.weight"])
+            mlp_input = rms_norm(
+                hidden,
+                params[f"{prefix}.post_attention_layernorm.weight"],
+                eps=preset.norm_eps,
+            )
+            return hidden + swiglu(
+                mlp_input,
+                params[f"{prefix}.mlp.gate_proj.weight"],
+                params[f"{prefix}.mlp.up_proj.weight"],
+                params[f"{prefix}.mlp.down_proj.weight"],
+            )
+
+        hidden = jax.checkpoint(block)(hidden, params) if recompute else block(hidden, params)
     hidden = rms_norm(hidden, params["model.norm.weight"], eps=preset.norm_eps)
     logits = _dense(hidden, params["model.embed_tokens.weight"])
     return logits
@@ -175,6 +206,8 @@ def forward(
     document_mask: bool = True,
     objective: str | None = None,
     special: SpecialTokens | None = None,
+    attention_impl: str = "xla",
+    recompute: bool = False,
 ) -> ModelOutput:
     """Run one forward pass and optionally compute the training loss.
 
@@ -188,11 +221,23 @@ def forward(
         document_mask: Restrict attention to the document that starts at each bos token.
         objective: ``"mlm"`` or ``"clm"``. Defaults by architecture.
         special: Special-token ids; defaults to HAMIC's fixed layout.
+        attention_impl: ``xla`` (fused), ``sdpa``/``flex_attention`` (fused aliases), or
+            ``reference`` (explicit fp32 audit path).
+        recompute: Rematerialise each transformer block in the backward pass. It trades
+            compute for activation memory, which is what keeps the larger presets inside
+            a v5e chip; the forward value and gradient are unchanged.
     """
     special = special or SpecialTokens()
     if preset.is_encoder:
         hidden = encoder_hidden(
-            params, preset, input_ids, attention_mask, document_mask, special
+            params,
+            preset,
+            input_ids,
+            attention_mask,
+            document_mask,
+            special,
+            attention_impl=attention_impl,
+            recompute=recompute,
         )
         head = jax.nn.gelu(_dense(hidden, params["head.dense.weight"]), approximate=False)
         head = layer_norm(head, params["head.norm.weight"], eps=preset.norm_eps)
@@ -200,7 +245,14 @@ def forward(
         logits = _linear_bias(head, embedding, params["decoder.bias"])
     else:
         hidden = _decoder_forward(
-            params, preset, input_ids, attention_mask, document_mask, special
+            params,
+            preset,
+            input_ids,
+            attention_mask,
+            document_mask,
+            special,
+            attention_impl=attention_impl,
+            recompute=recompute,
         )
         logits = hidden
     loss_value: Array | None = None
@@ -219,6 +271,8 @@ def loss(
     *,
     document_mask: bool = True,
     objective: str | None = None,
+    attention_impl: str = "xla",
+    recompute: bool = False,
 ) -> Array:
     """Return only the scalar loss (convenience for ``jax.value_and_grad``)."""
     return forward(
@@ -229,4 +283,6 @@ def loss(
         attention_mask,
         document_mask=document_mask,
         objective=objective,
+        attention_impl=attention_impl,
+        recompute=recompute,
     ).loss

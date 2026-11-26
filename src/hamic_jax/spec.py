@@ -239,6 +239,7 @@ class TrainingConfig:
     variant_share: float = 0.0
     shuffle: bool = True
     deterministic: bool = False
+    recompute: bool = True
 
     def __post_init__(self) -> None:
         if self.objective not in ("mlm", "clm"):
@@ -247,6 +248,8 @@ class TrainingConfig:
             raise ValueError("lr_schedule must be 'cosine' or 'wsd'")
         if self.masking not in ("token", "span", "pmi", "pmi_ngram"):
             raise ValueError("unsupported masking policy")
+        if self.attention not in ("sdpa", "flex_attention", "xla", "reference"):
+            raise ValueError("attention must be sdpa, flex_attention, xla or reference")
         if not 2 <= self.pmi_max_ngram <= 3:
             raise ValueError("pmi_max_ngram must be 2 or 3")
         if not 0 < self.decay_ratio <= 1:
@@ -360,6 +363,7 @@ _TRAIN_KEYS = {
     "variant_share",
     "shuffle",
     "deterministic",
+    "recompute",
     "log_every_steps",
     "eval_every_steps",
     "eval_sequences",
@@ -505,4 +509,5 @@ def training_config_from_mapping(data: Mapping[str, Any]) -> TrainingConfig:
         variant_share=float(data.get("variant_share", 0.0)),
         shuffle=bool(data.get("shuffle", True)),
         deterministic=bool(data.get("deterministic", False)),
+        recompute=bool(data.get("recompute", True)),
     )

@@ -246,6 +246,7 @@ def run_training_session(
     raw_config: Mapping[str, Any] | None = None,
     progress: Callable[[int, int, float], None] | None = None,
     log: Callable[[str], None] = print,
+    handle_preemption: bool = False,
 ) -> SessionReport:
     """Run or resume a real training session against the configured Hub store."""
     limits = SessionLimits(
@@ -268,6 +269,7 @@ def run_training_session(
         raw_config=dict(raw_config) if raw_config is not None else asdict(config),
         progress=progress,
         log=log,
+        handle_preemption=handle_preemption,
     )
 
 

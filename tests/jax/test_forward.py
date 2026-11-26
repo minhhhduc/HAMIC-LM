@@ -73,3 +73,34 @@ def test_encoder_hidden_matches_forward_prefix() -> None:
     hidden = encoder_hidden(params, preset, ids)
     assert hidden.shape == (1, 8, 32)
     assert forward(params, preset, ids).hidden.shape == (1, 8, 32)
+
+
+@pytest.mark.parametrize("preset_factory", [_encoder, _decoder])
+def test_recompute_matches_plain_forward_and_grad(
+    preset_factory: Callable[[], ModelPreset],
+) -> None:
+    """Rematerialisation must not change the forward value or the parameter gradient."""
+    preset = preset_factory()
+    params = init_params(preset, jax.random.PRNGKey(2))
+    ids = jnp.asarray(np.random.default_rng(1).integers(0, 128, (2, 8)), jnp.int32)
+    labels = ids.at[:, :2].set(-100)
+
+    plain = forward(params, preset, ids, labels, recompute=False)
+    remat = forward(params, preset, ids, labels, recompute=True)
+    np.testing.assert_allclose(np.asarray(plain.logits), np.asarray(remat.logits))
+    np.testing.assert_allclose(np.asarray(plain.loss), np.asarray(remat.loss))
+
+    def gradient(recompute: bool) -> dict[str, jnp.ndarray]:
+        return jax.grad(
+            lambda tree: forward(tree, preset, ids, labels, recompute=recompute).loss
+        )(params)
+
+    plain_grad = gradient(False)
+    remat_grad = gradient(True)
+    for name in plain_grad:
+        np.testing.assert_allclose(
+            np.asarray(plain_grad[name]),
+            np.asarray(remat_grad[name]),
+            rtol=1e-5,
+            atol=1e-6,
+        )

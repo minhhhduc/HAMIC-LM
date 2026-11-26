@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import signal
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -20,6 +21,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from hamic_jax.checkpoint import (
     CheckpointPublisher,
@@ -30,6 +32,7 @@ from hamic_jax.checkpoint import (
     save_checkpoint,
 )
 from hamic_jax.data import TokenizedCorpus, tokenized_prefix
+from hamic_jax.optim import learning_rate_schedule
 from hamic_jax.runs import (
     COMPLETE_NAME,
     mark_complete,
@@ -38,8 +41,9 @@ from hamic_jax.runs import (
     write_run_manifest,
     write_status,
 )
+from hamic_jax.sharding import device_label, peak_memory_gib
 from hamic_jax.spec import ModelPreset, TrainingConfig
-from hamic_jax.train import Trainer, evaluate
+from hamic_jax.train import Trainer, evaluate_metrics
 
 __all__ = [
     "SessionLimits",
@@ -79,6 +83,7 @@ class SessionReport:
     seconds: float
     interrupted: bool = False
     already_complete: bool = False
+    warnings: tuple[str, ...] = ()
 
     @property
     def status(self) -> str:
@@ -106,11 +111,6 @@ class SessionReport:
         ]
 
     @property
-    def warnings(self) -> list[str]:
-        """Non-fatal warnings; the JAX session currently emits none."""
-        return []
-
-    @property
     def evaluations(self) -> dict[int, float]:
         """Evaluation loss keyed by step for this session only."""
         start = self.resumed_from_step or 0
@@ -122,7 +122,7 @@ class SessionReport:
 
     @property
     def eval_bits_per_byte(self) -> dict[int, float]:
-        """Bits-per-byte by step for this session; empty until the evaluator tracks it."""
+        """Bits-per-byte by step for this session; CLM runs with a tokenizer copy."""
         start = self.resumed_from_step or 0
         return {
             int(record["step"]): float(record["eval_bpb"])
@@ -156,6 +156,7 @@ def run_session(
     publish: bool = True,
     progress: Callable[[int, int, float], None] | None = None,
     log: Callable[[str], None] = print,
+    handle_preemption: bool = False,
 ) -> SessionReport:
     """Train until the step/time limit, resuming from the latest committed checkpoint.
 
@@ -171,6 +172,8 @@ def run_session(
         publish: Publish manifests, checkpoints, metrics and markers.
         progress: Called as ``(step, target, loss)`` after every training step.
         log: Progress sink.
+        handle_preemption: Turn SIGTERM into a clean checkpoint and ``paused`` status.
+            A preemptible v5e host sends SIGTERM before it reclaims the VM.
 
     Returns:
         What the session did, including the loss sequence produced now.
@@ -227,6 +230,7 @@ def run_session(
         publisher = CheckpointPublisher(store, prefix)
 
     trainer = Trainer(config, preset, corpus)
+    warnings: list[str] = []
     if publish:
         assert store is not None
         resolver = CheckpointResolver(store, prefix)
@@ -242,10 +246,19 @@ def run_session(
                 )
             if metadata.get("identity") != config.identity():
                 raise RuntimeError("checkpoint identity does not match the training config")
-            trainer.params = jax.tree.map(
-                lambda leaf: jnp.asarray(leaf, dtype=jnp.float32), params
-            )
-            trainer.optimizer_state = optimizer_state
+            saved_commit = str(metadata.get("source_commit") or "")
+            running_commit = str(source_commit or "")
+            if saved_commit and running_commit and saved_commit != running_commit:
+                raise RuntimeError(
+                    "checkpoint code commit "
+                    f"{saved_commit[:12]} does not match running commit "
+                    f"{running_commit[:12]}"
+                )
+            if not saved_commit or not running_commit:
+                warnings.append(
+                    "code commit unknown on one side; continuing without a code check"
+                )
+            trainer.restore(params, optimizer_state)
             trainer.step = step
             trainer.batches.restore(cursor)
             resumed_from_step = step
@@ -264,67 +277,147 @@ def run_session(
     last_tokens = float(trainer.batches.consumed_tokens)
     last_elapsed = 0.0
     paused = False
+    schedule = learning_rate_schedule(config)
+    device = device_label()
+    pending: list[tuple[int, jax.Array, jax.Array, int, float]] = []
+    stop = {"requested": False}
+    previous_handler: Any = None
 
-    while trainer.step < target:
-        if deadline is not None and time.monotonic() >= deadline:
-            paused = True
-            break
-        losses.append(float(trainer.train_step()))
-        now = time.monotonic()
-        elapsed = now - started
-        record = {
-            "step": trainer.step,
-            "loss": losses[-1],
-            "tokens": trainer.batches.consumed_tokens,
-            "elapsed_seconds": round(elapsed, 3),
-        }
-        if elapsed > last_elapsed:
-            record["tokens_per_second"] = (record["tokens"] - last_tokens) / (
-                elapsed - last_elapsed
+    def flush() -> list[dict[str, Any]]:
+        """Read one log window's device scalars and append its metric records."""
+        nonlocal last_tokens, last_elapsed
+        if not pending:
+            return []
+        values = np.asarray(
+            jnp.stack(
+                [
+                    jnp.stack([item[1] for item in pending]),
+                    jnp.stack([item[2] for item in pending]),
+                ]
             )
-        last_tokens = float(record["tokens"])
-        last_elapsed = elapsed
-        if limits.eval_every_steps and trainer.step % limits.eval_every_steps == 0:
-            record["eval_loss"] = evaluate(
-                config,
-                preset,
-                corpus,
-                trainer.params,
-                sequences=limits.eval_sequences,
-            )
-        metrics.append(record)
-        if progress is not None:
-            progress(trainer.step, target, record["loss"])
-        if limits.log_every_steps and trainer.step % limits.log_every_steps == 0:
-            log(
-                f"step {trainer.step}/{target} loss {record['loss']:.5f} "
-                f"tokens {record['tokens']}"
-            )
-        due_steps = bool(
-            limits.checkpoint_every_steps
-            and trainer.step % limits.checkpoint_every_steps == 0
         )
-        due_time = bool(
-            limits.checkpoint_every_seconds
-            and now - last_checkpoint_time >= limits.checkpoint_every_seconds
-        )
-        if due_steps or due_time:
-            checkpoint = _persist(
-                trainer,
-                config,
-                preset,
-                corpus,
-                store,
-                publisher,
-                root,
-                source_commit,
-                log,
+        peak = peak_memory_gib()
+        records: list[dict[str, Any]] = []
+        for index, (step, _, _, tokens, step_elapsed) in enumerate(pending):
+            record: dict[str, Any] = {
+                "step": step,
+                "loss": float(values[0, index]),
+                "lr": float(schedule(max(0, step - 1))),
+                "grad_norm": float(values[1, index]),
+                "tokens": tokens,
+                "elapsed_seconds": round(step_elapsed, 3),
+                "device": device,
+                "commit": source_commit,
+            }
+            if peak is not None:
+                record["peak_hbm_gib"] = peak
+            if index == len(pending) - 1 and step_elapsed > last_elapsed:
+                record["tokens_per_second"] = (tokens - last_tokens) / (
+                    step_elapsed - last_elapsed
+                )
+            records.append(record)
+        losses.extend(record["loss"] for record in records)
+        metrics.extend(records)
+        last_tokens = float(pending[-1][3])
+        last_elapsed = pending[-1][4]
+        pending.clear()
+        return records
+
+    def _request_stop(signum: int, frame: Any) -> None:
+        stop["requested"] = True
+
+    if handle_preemption:
+        try:
+            previous_handler = signal.signal(signal.SIGTERM, _request_stop)
+        except (ValueError, OSError):
+            warnings.append("SIGTERM handler unavailable; preemption will not checkpoint")
+
+    try:
+        while trainer.step < target:
+            if stop["requested"]:
+                paused = True
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                paused = True
+                break
+            loss, norm = trainer.train_step_metrics()
+            now = time.monotonic()
+            pending.append(
+                (
+                    trainer.step,
+                    loss,
+                    norm,
+                    trainer.batches.consumed_tokens,
+                    now - started,
+                )
             )
-            if checkpoint is not None:
-                checkpoints.append(checkpoint)
-                last_checkpoint_step = trainer.step
-                last_checkpoint_time = now
-                _publish_metrics(root, store, config.run_id, metrics, publish)
+            due_eval = bool(
+                limits.eval_every_steps
+                and trainer.step % limits.eval_every_steps == 0
+            )
+            due_log = bool(
+                limits.log_every_steps
+                and trainer.step % limits.log_every_steps == 0
+            )
+            records = (
+                flush()
+                if due_eval or due_log or progress is not None
+                else []
+            )
+            current = records[-1] if records else None
+            if due_eval:
+                assert current is not None
+                eval_loss, eval_bpb = evaluate_metrics(
+                    config,
+                    preset,
+                    corpus,
+                    trainer.params,
+                    sequences=limits.eval_sequences,
+                )
+                current["eval_loss"] = eval_loss
+                if eval_bpb is not None:
+                    current["eval_bpb"] = eval_bpb
+            if progress is not None:
+                assert current is not None
+                progress(trainer.step, target, float(current["loss"]))
+            if due_log:
+                assert current is not None
+                log(
+                    f"step {trainer.step}/{target} loss {current['loss']:.5f} "
+                    f"lr {current['lr']:.3g} |g| {current['grad_norm']:.3f} "
+                    f"tokens {current['tokens']}"
+                )
+            now = time.monotonic()
+            due_steps = bool(
+                limits.checkpoint_every_steps
+                and trainer.step % limits.checkpoint_every_steps == 0
+            )
+            due_time = bool(
+                limits.checkpoint_every_seconds
+                and now - last_checkpoint_time >= limits.checkpoint_every_seconds
+            )
+            if due_steps or due_time:
+                flush()
+                checkpoint = _persist(
+                    trainer,
+                    config,
+                    preset,
+                    corpus,
+                    store,
+                    publisher,
+                    root,
+                    source_commit,
+                    log,
+                )
+                if checkpoint is not None:
+                    checkpoints.append(checkpoint)
+                    last_checkpoint_step = trainer.step
+                    last_checkpoint_time = now
+                    _publish_metrics(root, store, config.run_id, metrics, publish)
+    finally:
+        if previous_handler is not None:
+            signal.signal(signal.SIGTERM, previous_handler)
+    flush()
 
     completed = trainer.step >= total_steps
     interrupted = bool(
@@ -390,6 +483,7 @@ def run_session(
         paused=paused,
         seconds=time.monotonic() - started,
         interrupted=interrupted,
+        warnings=tuple(warnings),
     )
 
 
