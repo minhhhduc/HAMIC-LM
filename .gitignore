@@ -28,6 +28,8 @@
 !/docs/architecture/naming-and-model-family.md
 !/docs/architecture/component-walkthrough.md
 !/docs/architecture/corpus-expansion-dedup-and-scaling.md
+!/docs/architecture/tpu-jax/
+!/docs/architecture/tpu-jax/*.md
 
 # Never commit these, even inside allowed folders.
 __pycache__/
