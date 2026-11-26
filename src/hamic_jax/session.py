@@ -343,87 +343,88 @@ def run_session(
             warnings.append("SIGTERM handler unavailable; preemption will not checkpoint")
 
     try:
-        while trainer.step < target:
-            if stop["requested"]:
-                paused = True
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                paused = True
-                break
-            loss, norm = trainer.train_step_metrics()
-            now = time.monotonic()
-            pending.append(
-                (
-                    trainer.step,
-                    loss,
-                    norm,
-                    trainer.batches.consumed_tokens,
-                    now - started,
+        with trainer.prefetch(depth=2):
+            while trainer.step < target:
+                if stop["requested"]:
+                    paused = True
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    paused = True
+                    break
+                loss, norm = trainer.train_step_metrics()
+                now = time.monotonic()
+                pending.append(
+                    (
+                        trainer.step,
+                        loss,
+                        norm,
+                        trainer.batches.consumed_tokens,
+                        now - started,
+                    )
                 )
-            )
-            due_eval = bool(
-                limits.eval_every_steps
-                and trainer.step % limits.eval_every_steps == 0
-            )
-            due_log = bool(
-                limits.log_every_steps
-                and trainer.step % limits.log_every_steps == 0
-            )
-            records = (
-                flush()
-                if due_eval or due_log or progress is not None
-                else []
-            )
-            current = records[-1] if records else None
-            if due_eval:
-                assert current is not None
-                eval_loss, eval_bpb = evaluate_metrics(
-                    config,
-                    preset,
-                    corpus,
-                    trainer.params,
-                    sequences=limits.eval_sequences,
+                due_eval = bool(
+                    limits.eval_every_steps
+                    and trainer.step % limits.eval_every_steps == 0
                 )
-                current["eval_loss"] = eval_loss
-                if eval_bpb is not None:
-                    current["eval_bpb"] = eval_bpb
-            if progress is not None:
-                assert current is not None
-                progress(trainer.step, target, float(current["loss"]))
-            if due_log:
-                assert current is not None
-                log(
-                    f"step {trainer.step}/{target} loss {current['loss']:.5f} "
-                    f"lr {current['lr']:.3g} |g| {current['grad_norm']:.3f} "
-                    f"tokens {current['tokens']}"
+                due_log = bool(
+                    limits.log_every_steps
+                    and trainer.step % limits.log_every_steps == 0
                 )
-            now = time.monotonic()
-            due_steps = bool(
-                limits.checkpoint_every_steps
-                and trainer.step % limits.checkpoint_every_steps == 0
-            )
-            due_time = bool(
-                limits.checkpoint_every_seconds
-                and now - last_checkpoint_time >= limits.checkpoint_every_seconds
-            )
-            if due_steps or due_time:
-                flush()
-                checkpoint = _persist(
-                    trainer,
-                    config,
-                    preset,
-                    corpus,
-                    store,
-                    publisher,
-                    root,
-                    source_commit,
-                    log,
+                records = (
+                    flush()
+                    if due_eval or due_log or progress is not None
+                    else []
                 )
-                if checkpoint is not None:
-                    checkpoints.append(checkpoint)
-                    last_checkpoint_step = trainer.step
-                    last_checkpoint_time = now
-                    _publish_metrics(root, store, config.run_id, metrics, publish)
+                current = records[-1] if records else None
+                if due_eval:
+                    assert current is not None
+                    eval_loss, eval_bpb = evaluate_metrics(
+                        config,
+                        preset,
+                        corpus,
+                        trainer.params,
+                        sequences=limits.eval_sequences,
+                    )
+                    current["eval_loss"] = eval_loss
+                    if eval_bpb is not None:
+                        current["eval_bpb"] = eval_bpb
+                if progress is not None:
+                    assert current is not None
+                    progress(trainer.step, target, float(current["loss"]))
+                if due_log:
+                    assert current is not None
+                    log(
+                        f"step {trainer.step}/{target} loss {current['loss']:.5f} "
+                        f"lr {current['lr']:.3g} |g| {current['grad_norm']:.3f} "
+                        f"tokens {current['tokens']}"
+                    )
+                now = time.monotonic()
+                due_steps = bool(
+                    limits.checkpoint_every_steps
+                    and trainer.step % limits.checkpoint_every_steps == 0
+                )
+                due_time = bool(
+                    limits.checkpoint_every_seconds
+                    and now - last_checkpoint_time >= limits.checkpoint_every_seconds
+                )
+                if due_steps or due_time:
+                    flush()
+                    checkpoint = _persist(
+                        trainer,
+                        config,
+                        preset,
+                        corpus,
+                        store,
+                        publisher,
+                        root,
+                        source_commit,
+                        log,
+                    )
+                    if checkpoint is not None:
+                        checkpoints.append(checkpoint)
+                        last_checkpoint_step = trainer.step
+                        last_checkpoint_time = now
+                        _publish_metrics(root, store, config.run_id, metrics, publish)
     finally:
         if previous_handler is not None:
             signal.signal(signal.SIGTERM, previous_handler)
@@ -625,6 +626,9 @@ def _persist(
         if store.read_bytes(remote) is None:
             publisher.publish(local, metadata)
             log(f"published checkpoint {name}")
+        for older in (root / "checkpoints").glob("step-*"):
+            if older != local and older.is_dir():
+                shutil.rmtree(older, ignore_errors=True)
     return str(local)
 
 

@@ -8,8 +8,11 @@ JAX function with gradient accumulation via ``lax.scan``.
 from __future__ import annotations
 
 import math
+import queue
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +20,7 @@ import numpy as np
 import optax
 
 from hamic_jax.data import PackedBatches, TokenizedCorpus
-from hamic_jax.model import forward
+from hamic_jax.model import forward, loss as model_loss
 from hamic_jax.objectives import CLMObjective, MLMObjective, MaskedBatch
 from hamic_jax.optim import build_optimizer
 from hamic_jax.params import init_params
@@ -30,6 +33,12 @@ Array = jax.Array
 
 # Validation masks each batch with a distinct, run-independent seed, as the oracle does.
 _EVAL_SEED_OFFSET = 1 << 40
+
+
+def _sparse_capacity(per_chip_tokens: int, peak_mask_rate: float) -> int | None:
+    """Upper-bound masked-token capacity per chip, rounded up to 128 for TPU MXU."""
+    cap = ((math.ceil(per_chip_tokens * min(1.0, peak_mask_rate + 0.12)) + 127) // 128) * 128
+    return cap if 0 < cap < per_chip_tokens else None
 
 
 @dataclass
@@ -68,6 +77,9 @@ class Trainer:
             raise ValueError("sparse_prediction is a ModernBERT option")
         self.config = config
         self.preset = preset
+        self._corpus = corpus
+        self._seed = config.seed if seed is None else seed
+        self._prefetch_queue: queue.Queue[Any] | None = None
         self.dtype = dtype if dtype is not None else (
             jnp.bfloat16 if config.precision == "bf16" else jnp.float32
         )
@@ -78,7 +90,7 @@ class Trainer:
             batch_size=config.micro_batch_size,
             bos_id=preset.special_tokens.bos_id,
             eos_id=preset.special_tokens.eos_id,
-            seed=config.seed if seed is None else seed,
+            seed=self._seed,
             shuffle=config.shuffle,
             source_weights=dict(config.source_weights) or None,
         )
@@ -184,21 +196,27 @@ class Trainer:
         config = self.config
         layout = self.layout
 
+        sparse_cap: int | None = None
+        if config.sparse_prediction and preset.is_encoder and config.objective == "mlm":
+            per_chip_tokens = (config.micro_batch_size // layout.data_parallel) * config.seq_len
+            peak_rate = max(config.mask_rate, config.mask_rate_final or config.mask_rate)
+            sparse_cap = _sparse_capacity(per_chip_tokens, peak_rate)
+
         def loss_fn(
             params: dict[str, Array], input_ids: Array, labels: Array
         ) -> Array:
-            output = forward(
+            return model_loss(
                 params,
                 preset,
                 input_ids,
                 labels,
                 document_mask=not config.cross_document_attention,
                 objective=config.objective,
+                special=preset.special_tokens,
                 attention_impl=config.attention,
                 recompute=config.recompute,
+                sparse_capacity=sparse_cap,
             )
-            assert output.loss is not None
-            return output.loss
 
         def step(
             params: dict[str, Array],
@@ -283,18 +301,99 @@ class Trainer:
             label_rows.append(masked.labels)
         return np.stack(ids_rows), np.stack(label_rows)
 
+    @contextmanager
+    def prefetch(self, depth: int = 2) -> Iterator[None]:
+        """Overlap host packing/masking and H2D transfer with TPU execution."""
+        if depth <= 0:
+            yield
+            return
+        q: queue.Queue[Any] = queue.Queue(maxsize=depth)
+        stop = threading.Event()
+        worker_batches = PackedBatches(
+            self._corpus,
+            "train",
+            seq_len=self.config.seq_len,
+            batch_size=self.config.micro_batch_size,
+            bos_id=self.preset.special_tokens.bos_id,
+            eos_id=self.preset.special_tokens.eos_id,
+            seed=self._seed,
+            shuffle=self.config.shuffle,
+            cursor=self.batches.cursor(),
+            source_weights=dict(self.config.source_weights) or None,
+        )
+        start_step = self.step
+
+        def _produce() -> None:
+            worker_step = start_step
+            try:
+                while not stop.is_set():
+                    ids_rows = []
+                    label_rows = []
+                    for index in range(self.config.grad_accum_steps):
+                        rows = worker_batches.next_batch()
+                        masked: MaskedBatch = self.objective(
+                            rows, worker_step * self.config.grad_accum_steps + index
+                        )
+                        ids_rows.append(masked.input_ids)
+                        label_rows.append(masked.labels)
+                    placed_ids = self.layout.place_stack(np.stack(ids_rows))
+                    placed_labels = self.layout.place_stack(np.stack(label_rows))
+                    item = ("batch", placed_ids, placed_labels, worker_batches.cursor())
+                    worker_step += 1
+                    while not stop.is_set():
+                        try:
+                            q.put(item, timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
+            except BaseException as exc:  # noqa: BLE001 - propagate worker failure to caller
+                while not stop.is_set():
+                    try:
+                        q.put(("error", exc), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+
+        thread = threading.Thread(target=_produce, name="hamic-jax-prefetch", daemon=True)
+        thread.start()
+        self._prefetch_queue = q
+        try:
+            yield
+        finally:
+            self._prefetch_queue = None
+            stop.set()
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
+            thread.join(timeout=5.0)
+            self.batches.restore(self.batches.cursor())
+
     def train_step_metrics(self) -> tuple[Array, Array]:
         """Run one optimizer step and return ``(loss, gradient_norm)`` device scalars.
 
         Neither scalar is synchronised here. Callers that log every step can read both
         once at the end of a log window, which keeps the TPU queue full.
         """
-        ids, labels = self._micro_batches()
+        if self._prefetch_queue is not None:
+            item = self._prefetch_queue.get()
+            if item[0] == "error":
+                raise item[1]
+            _, placed_ids, placed_labels, next_cursor = item
+            self.batches.epoch = next_cursor.epoch
+            self.batches.position = next_cursor.offset
+            self.batches.token_offset = next_cursor.token_offset
+            self.batches.consumed_tokens = next_cursor.consumed_tokens
+        else:
+            ids, labels = self._micro_batches()
+            placed_ids = self.layout.place_stack(ids)
+            placed_labels = self.layout.place_stack(labels)
         new_params, new_optimizer_state, loss, norm = self._step_fn(
             self.params,
             self.optimizer_state,
-            self.layout.place_stack(ids),
-            self.layout.place_stack(labels),
+            placed_ids,
+            placed_labels,
         )
         self.params = new_params
         self.optimizer_state = new_optimizer_state
@@ -407,26 +506,32 @@ def evaluate_metrics(
         jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype=dtype), params)
     )
 
+    eval_sparse_cap: int | None = None
+    if config.sparse_prediction and preset.is_encoder and config.objective == "mlm":
+        eval_per_chip = (batch // layout.data_parallel) * config.seq_len
+        eval_sparse_cap = _sparse_capacity(eval_per_chip, rate)
+
     def eval_step(
         shard_params: dict[str, Array],
         input_ids: Array,
         labels: Array,
     ) -> tuple[Array, Array]:
-        output = forward(
+        loss_value = model_loss(
             shard_params,
             preset,
             input_ids,
             labels,
             document_mask=not config.cross_document_attention,
             objective=config.objective,
+            special=preset.special_tokens,
             attention_impl=config.attention,
             recompute=False,
+            sparse_capacity=eval_sparse_cap,
         )
-        assert output.loss is not None
         targets = labels[:, 1:] if config.objective == "clm" else labels
         valid = targets != -100
         local_count = jnp.sum(valid.astype(jnp.float32))
-        local_nats = output.loss * local_count
+        local_nats = loss_value * local_count
         global_nats = jax.lax.psum(local_nats, "data")
         global_count = jax.lax.psum(local_count, "data")
         global_loss = global_nats / jnp.maximum(global_count, 1.0)

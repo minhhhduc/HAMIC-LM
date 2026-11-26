@@ -11,6 +11,7 @@ from hamic_jax.objectives import (
     MLMObjective,
     NgramTables,
     NgramUnits,
+    PmiUnits,
     TokenClasses,
     TokenUnits,
     VariantTable,
@@ -85,3 +86,19 @@ def test_variant_masking_preserves_the_original_label() -> None:
     assert selected.any()
     assert (batch.input_ids[selected] == 38).any()
     assert set(batch.input_ids[selected]) <= {37, 38}
+
+
+def test_pmi_units_binary_search_matches_pair_table() -> None:
+    pair = 37 * 128 + 38
+    units = PmiUnits(np.array([pair], dtype=np.int64), 128, SPECIAL_TOKENS.special_ids)
+    out = units(np.array([[37, 38, 39, 0, 37, 38]]), np.random.default_rng(0))
+    assert out.tolist() == [[0, 0, 1, 2, 3, 3]]
+    objective = MLMObjective(
+        vocab_size=128,
+        special=SPECIAL_TOKENS,
+        masking="pmi",
+        pmi_pairs=np.array([pair], dtype=np.int64),
+    )
+    batch = objective(np.array([[37, 38, 39, 0, 37, 38]]), step=0)
+    assert batch.labels.shape == (1, 6)
+    assert batch.labels[0, 3] == -100

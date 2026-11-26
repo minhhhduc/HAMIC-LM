@@ -196,6 +196,55 @@ def cross_entropy(logits: Array, labels: Array, causal: bool) -> Array:
     return numerator / denominator
 
 
+def _mlm_head_logits(
+    hidden: Array, params: dict[str, Array], preset: ModelPreset
+) -> Array:
+    head = jax.nn.gelu(_dense(hidden, params["head.dense.weight"]), approximate=False)
+    head = layer_norm(head, params["head.norm.weight"], eps=preset.norm_eps)
+    embedding = params["model.embeddings.tok_embeddings.weight"]
+    return _linear_bias(head, embedding, params["decoder.bias"])
+
+
+def _sparse_mlm_loss(
+    hidden: Array,
+    labels: Array,
+    params: dict[str, Array],
+    preset: ModelPreset,
+    capacity: int,
+) -> Array:
+    flat_hidden = hidden.reshape(-1, hidden.shape[-1])
+    flat_labels = labels.reshape(-1)
+    valid_flat = flat_labels != _IGNORE_INDEX
+    num_valid = jnp.sum(valid_flat)
+
+    def sparse_branch(operand: tuple[Array, Array, dict[str, Array]]) -> Array:
+        h, y, p = operand
+        idx = jnp.nonzero(y != _IGNORE_INDEX, size=capacity, fill_value=0)[0]
+        gathered_h = h[idx]
+        gathered_y = y[idx]
+        slot_valid = jnp.arange(capacity) < num_valid
+        safe_y = jnp.where(slot_valid, gathered_y, 0)
+        logits = _mlm_head_logits(gathered_h, p, preset)
+        token_loss = optax.softmax_cross_entropy_with_integer_labels(
+            logits.astype(jnp.float32), safe_y
+        )
+        numerator = jnp.sum(jnp.where(slot_valid, token_loss, 0.0))
+        denominator = jnp.maximum(num_valid.astype(jnp.float32), 1.0)
+        return numerator / denominator
+
+    def dense_branch(operand: tuple[Array, Array, dict[str, Array]]) -> Array:
+        h, y, p = operand
+        logits = _mlm_head_logits(h, p, preset)
+        return cross_entropy(logits, y, causal=False)
+
+    return jax.lax.cond(
+        num_valid <= capacity,
+        sparse_branch,
+        dense_branch,
+        (flat_hidden, flat_labels, params),
+    )
+
+
 def forward(
     params: dict[str, Array],
     preset: ModelPreset,
@@ -239,10 +288,7 @@ def forward(
             attention_impl=attention_impl,
             recompute=recompute,
         )
-        head = jax.nn.gelu(_dense(hidden, params["head.dense.weight"]), approximate=False)
-        head = layer_norm(head, params["head.norm.weight"], eps=preset.norm_eps)
-        embedding = params["model.embeddings.tok_embeddings.weight"]
-        logits = _linear_bias(head, embedding, params["decoder.bias"])
+        logits = _mlm_head_logits(hidden, params, preset)
     else:
         hidden = _decoder_forward(
             params,
@@ -271,11 +317,31 @@ def loss(
     *,
     document_mask: bool = True,
     objective: str | None = None,
+    special: SpecialTokens | None = None,
     attention_impl: str = "xla",
     recompute: bool = False,
+    sparse_capacity: int | None = None,
 ) -> Array:
     """Return only the scalar loss (convenience for ``jax.value_and_grad``)."""
-    return forward(
+    chosen = objective or ("mlm" if preset.is_encoder else "clm")
+    if (
+        preset.is_encoder
+        and chosen == "mlm"
+        and sparse_capacity is not None
+        and 0 < sparse_capacity < input_ids.shape[0] * input_ids.shape[1]
+    ):
+        hidden = encoder_hidden(
+            params,
+            preset,
+            input_ids,
+            attention_mask,
+            document_mask,
+            special,
+            attention_impl=attention_impl,
+            recompute=recompute,
+        )
+        return _sparse_mlm_loss(hidden, labels, params, preset, sparse_capacity)
+    result = forward(
         params,
         preset,
         input_ids,
@@ -283,6 +349,9 @@ def loss(
         attention_mask,
         document_mask=document_mask,
         objective=objective,
+        special=special,
         attention_impl=attention_impl,
         recompute=recompute,
-    ).loss
+    )
+    assert result.loss is not None
+    return result.loss

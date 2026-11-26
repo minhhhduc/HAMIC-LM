@@ -14,7 +14,7 @@ import pytest
 pytest.importorskip("optax")
 
 from hamic_jax.data import MANIFEST_NAME, TokenizedCorpus  # noqa: E402
-from hamic_jax.model import encoder_hidden, forward  # noqa: E402
+from hamic_jax.model import encoder_hidden, forward, loss as model_loss  # noqa: E402
 from hamic_jax.params import init_params  # noqa: E402
 from hamic_jax.sharding import DeviceLayout  # noqa: E402
 from hamic_jax.spec import ModelPreset, TrainingConfig  # noqa: E402
@@ -151,3 +151,27 @@ def test_sharded_mlm_step_matches_a_full_batch(tmp_path: Path, monkeypatch) -> N
     sharded = update(2)
     for expected, actual in zip(single, sharded, strict=True):
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("sparse_capacity", [6, 2])
+def test_sparse_mlm_loss_matches_dense_value_and_grad(sparse_capacity: int) -> None:
+    preset = _encoder()
+    params = init_params(preset, jax.random.PRNGKey(3))
+    ids = jnp.asarray(np.random.default_rng(2).integers(0, 128, (2, 8)), jnp.int32)
+    labels = jnp.full((2, 8), -100, dtype=jnp.int32).at[0, :3].set(ids[0, :3]).at[1, 1].set(ids[1, 1])
+
+    dense_val, dense_grad = jax.value_and_grad(
+        lambda tree: model_loss(tree, preset, ids, labels, sparse_capacity=None)
+    )(params)
+    sparse_val, sparse_grad = jax.value_and_grad(
+        lambda tree: model_loss(tree, preset, ids, labels, sparse_capacity=sparse_capacity)
+    )(params)
+
+    np.testing.assert_allclose(np.asarray(sparse_val), np.asarray(dense_val), rtol=1e-5, atol=1e-6)
+    for name in dense_grad:
+        np.testing.assert_allclose(
+            np.asarray(sparse_grad[name]),
+            np.asarray(dense_grad[name]),
+            rtol=1e-5,
+            atol=1e-6,
+        )

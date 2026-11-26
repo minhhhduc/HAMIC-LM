@@ -43,6 +43,13 @@ __all__ = [
 _IGNORE_INDEX = -100
 
 
+def _in_sorted(table: np.ndarray[Any, Any], keys: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
+    if table.size == 0 or keys.size == 0:
+        return np.zeros(keys.shape, dtype=bool)
+    where = np.searchsorted(table, keys).clip(max=table.size - 1)
+    return table[where] == keys
+
+
 @dataclass(frozen=True)
 class MaskedBatch:
     """The two arrays consumed by the model for one microbatch."""
@@ -106,16 +113,21 @@ class PmiUnits:
         self.pairs = np.sort(np.asarray(pairs, dtype=np.int64))
         self.vocab_size = vocab_size
         self.special = np.asarray(sorted(set(special_ids)), dtype=np.int64)
+        lut = np.zeros(vocab_size, dtype=bool)
+        lut[self.special] = True
+        self._special_lut = lut
         self.keep = keep
         self.max_length = max_length
 
     def __call__(
         self, ids: np.ndarray[Any, Any], rng: np.random.Generator
     ) -> np.ndarray[Any, Any]:
-        regular = ~np.isin(ids, self.special)
+        regular = ~self._special_lut[ids]
         keys = ids[:, :-1].astype(np.int64) * self.vocab_size + ids[:, 1:].astype(np.int64)
-        joined = np.isin(keys, self.pairs)
-        joined &= regular[:, :-1] & regular[:, 1:]
+        cand = regular[:, :-1] & regular[:, 1:]
+        joined = np.zeros(keys.shape, dtype=bool)
+        if cand.any():
+            joined[cand] = _in_sorted(self.pairs, keys[cand])
         if self.keep < 1:
             joined &= rng.random(keys.shape) < self.keep
         starts = np.ones_like(ids, dtype=bool)
@@ -464,7 +476,10 @@ class NgramUnits:
                 keys = keys * self.base + ids[:, offset : offset + width]
                 valid &= complete[:, offset : offset + width]
                 free &= ~occupied[:, offset : offset + width]
-            match = valid & free & np.isin(keys, table)
+            cand = valid & free
+            match = np.zeros((batch, width), dtype=bool)
+            if cand.any():
+                match[cand] = _in_sorted(table, keys[cand])
             if self.keep < 1:
                 match &= rng.random((batch, width)) < self.keep
             blocked = np.zeros_like(match)
@@ -564,6 +579,8 @@ class MLMObjective:
     whole_word_masking: bool = False
     ngram_tables: NgramTables | None = None
     token_classes: TokenClasses | None = None
+    _unit_fn: Any = field(init=False, repr=False, compare=False)
+    _special_lut: np.ndarray[Any, Any] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not 0 < self.mask_rate < 1:
@@ -582,6 +599,10 @@ class MLMObjective:
             raise ValueError("variant_share must be in [0, mask_share + random_share]")
         if self.variant_share and self.variants is None:
             raise ValueError("variant_share needs a spelling-variant table")
+        self._unit_fn = self._units()
+        lut = np.zeros(self.vocab_size, dtype=bool)
+        lut[list(self.special.special_ids)] = True
+        self._special_lut = lut
 
     def rate_at(self, step: int) -> float:
         """Mask rate at a global micro-step."""
@@ -626,8 +647,8 @@ class MLMObjective:
         """Return masked inputs and labels for one microbatch."""
         rng = np.random.default_rng(self.seed * 1_000_003 + step)
         ids = np.asarray(input_ids, dtype=np.int64)
-        maskable = ~np.isin(ids, np.asarray(self.special.special_ids, dtype=np.int64))
-        unit = self._units()(ids, rng)
+        maskable = ~self._special_lut[ids]
+        unit = self._unit_fn(ids, rng)
         rate = self.rate_at(step)
         selected = np.take_along_axis(rng.random(ids.shape) < rate, unit, axis=1)
         selected &= maskable
