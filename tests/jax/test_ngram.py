@@ -13,6 +13,7 @@ from hamic_jax.objectives import (
     NgramUnits,
     TokenClasses,
     TokenUnits,
+    VariantTable,
     WholeWordUnits,
     mine_pmi_ngrams,
 )
@@ -74,3 +75,13 @@ def test_missing_tables_rejected() -> None:
     except ValueError:
         return
     raise AssertionError("pmi_ngram without tables must raise")
+
+
+def test_variant_masking_preserves_the_original_label() -> None:
+    variants = VariantTable.from_vocabulary([""] * 37 + ["không", "ko"])
+    objective = MLMObjective(vocab_size=39, mask_rate=0.9, variant_share=0.9, variants=variants)
+    batch = objective(np.full((2, 128), 37), step=0)
+    selected = batch.labels == 37
+    assert selected.any()
+    assert (batch.input_ids[selected] == 38).any()
+    assert set(batch.input_ids[selected]) <= {37, 38}

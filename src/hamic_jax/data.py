@@ -100,6 +100,11 @@ class TokenizedCorpus:
         return str(value) if value else None
 
     @property
+    def manifest_sha256(self) -> str:
+        """Fingerprint the corpus layout and recorded shard checksums for strict resume."""
+        return hashlib.sha256(json.dumps(self.manifest, sort_keys=True).encode()).hexdigest()
+
+    @property
     def vocab_size(self) -> int:
         """Vocabulary size recorded in the manifest."""
         return int((self.manifest.get("tokenizer") or {})["vocab_size"])

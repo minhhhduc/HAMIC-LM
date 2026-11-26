@@ -63,3 +63,4 @@ __marimo__/
 *.key
 *token*.json
 credentials*.json
+.claude

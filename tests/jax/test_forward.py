@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -11,9 +13,12 @@ import pytest
 
 pytest.importorskip("optax")
 
+from hamic_jax.data import MANIFEST_NAME, TokenizedCorpus  # noqa: E402
 from hamic_jax.model import encoder_hidden, forward  # noqa: E402
 from hamic_jax.params import init_params  # noqa: E402
-from hamic_jax.spec import ModelPreset  # noqa: E402
+from hamic_jax.sharding import DeviceLayout  # noqa: E402
+from hamic_jax.spec import ModelPreset, TrainingConfig  # noqa: E402
+from hamic_jax.train import Trainer  # noqa: E402
 
 
 def _encoder() -> ModelPreset:
@@ -104,3 +109,45 @@ def test_recompute_matches_plain_forward_and_grad(
             rtol=1e-5,
             atol=1e-6,
         )
+
+
+def test_sharded_mlm_step_matches_a_full_batch(tmp_path: Path, monkeypatch) -> None:
+    devices = jax.local_devices()
+    if len(devices) < 2:
+        pytest.skip("requires two local JAX devices")
+
+    tokens = np.arange(40, 56, dtype=np.uint16)
+    (tmp_path / "train").mkdir()
+    np.save(tmp_path / "train" / "tokens.npy", tokens)
+    np.save(tmp_path / "train" / "offsets.npy", [0, len(tokens)])
+    files = {name: {"path": f"{name}.npy"} for name in ("tokens", "offsets")}
+    (tmp_path / MANIFEST_NAME).write_text(json.dumps({
+        "format": "hamic-tokenized-npy-v1",
+        "splits": {"train": {"shards": [{"files": files}]}},
+    }))
+    corpus = TokenizedCorpus(tmp_path)
+    config = TrainingConfig(
+        "mesh-test", "tiny-encoder", str(tmp_path), "mlm", 4, 2, 2, 32, 1e-3,
+        precision="fp32",
+    )
+    ids = np.array([[[40, 41, 42, 43], [44, 45, 46, 47]]] * 2, dtype=np.int32)
+    labels = np.array([
+        [[40, -100, -100, -100], [44, 45, 46, -100]],
+        [[-100, -100, -100, -100], [44, 45, -100, -100]],
+    ], dtype=np.int32)
+
+    choose_layout = DeviceLayout.for_batch
+
+    def update(device_count):
+        monkeypatch.setattr(
+            DeviceLayout, "for_batch", lambda batch: choose_layout(batch, devices[:device_count])
+        )
+        trainer = Trainer(config, _encoder(), corpus)
+        monkeypatch.setattr(trainer, "_micro_batches", lambda: (ids, labels))
+        metrics = trainer.train_step_metrics()
+        return (*metrics, *jax.tree.leaves(trainer.params))
+
+    single = update(1)
+    sharded = update(2)
+    for expected, actual in zip(single, sharded, strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)

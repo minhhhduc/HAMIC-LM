@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import signal
 import time
 import uuid
@@ -188,21 +189,6 @@ def run_session(
     root = Path(workdir)
     root.mkdir(parents=True, exist_ok=True)
     prefix = run_prefix(config.run_id)
-    if publish:
-        assert store is not None
-        if store.read_bytes(f"{prefix}/{COMPLETE_NAME}") is not None:
-            return SessionReport(
-                run_id=config.run_id,
-                step=config.total_steps,
-                resumed_from_step=None,
-                losses=(),
-                metrics=(),
-                checkpoints=(),
-                completed=True,
-                paused=False,
-                seconds=0.0,
-                already_complete=True,
-            )
     started = time.monotonic()
     losses: list[float] = []
     metrics: list[dict[str, Any]] = _load_metrics(root, store, prefix, publish)
@@ -220,6 +206,7 @@ def run_session(
             "source_commit": source_commit,
             "param_count": preset.num_parameters,
             "tokenizer_sha256": corpus.tokenizer_sha256,
+            "corpus_sha256": corpus.manifest_sha256,
             "tokenized_prefix": tokenized_prefix(config.tokenized),
             "total_steps": config.total_steps,
             "total_tokens": config.total_tokens,
@@ -227,6 +214,19 @@ def run_session(
         }
         assert store is not None
         write_run_manifest(store, manifest, f"open run {config.run_id}")
+        if store.read_bytes(f"{prefix}/{COMPLETE_NAME}") is not None:
+            return SessionReport(
+                run_id=config.run_id,
+                step=config.total_steps,
+                resumed_from_step=None,
+                losses=(),
+                metrics=(),
+                checkpoints=(),
+                completed=True,
+                paused=False,
+                seconds=0.0,
+                already_complete=True,
+            )
         publisher = CheckpointPublisher(store, prefix)
 
     trainer = Trainer(config, preset, corpus)
@@ -235,34 +235,40 @@ def run_session(
         assert store is not None
         resolver = CheckpointResolver(store, prefix)
         restore_dir = root / f"restore-{uuid.uuid4().hex}"
-        remote = resolver.restore_latest(restore_dir)
-        if remote is not None:
-            params, optimizer_state, step, cursor, metadata = load_checkpoint(
-                restore_dir, trainer.optimizer
-            )
-            if metadata.get("backend") != "jax":
-                raise RuntimeError(
-                    f"checkpoint backend is {metadata.get('backend')!r}, not 'jax'"
+        try:
+            remote = resolver.restore_latest(restore_dir)
+            if remote is not None:
+                params, optimizer_state, step, cursor, metadata = load_checkpoint(
+                    restore_dir, trainer.optimizer
                 )
-            if metadata.get("identity") != config.identity():
-                raise RuntimeError("checkpoint identity does not match the training config")
-            saved_commit = str(metadata.get("source_commit") or "")
-            running_commit = str(source_commit or "")
-            if saved_commit and running_commit and saved_commit != running_commit:
-                raise RuntimeError(
-                    "checkpoint code commit "
-                    f"{saved_commit[:12]} does not match running commit "
-                    f"{running_commit[:12]}"
-                )
-            if not saved_commit or not running_commit:
-                warnings.append(
-                    "code commit unknown on one side; continuing without a code check"
-                )
-            trainer.restore(params, optimizer_state)
-            trainer.step = step
-            trainer.batches.restore(cursor)
-            resumed_from_step = step
-            log(f"resumed {config.run_id} at step {step}")
+                if metadata.get("backend") != "jax":
+                    raise RuntimeError(
+                        f"checkpoint backend is {metadata.get('backend')!r}, not 'jax'"
+                    )
+                if metadata.get("identity") != config.identity():
+                    raise RuntimeError("checkpoint identity does not match the training config")
+                if metadata.get("corpus_sha256") != corpus.manifest_sha256:
+                    raise RuntimeError("checkpoint corpus does not match the tokenized corpus")
+                saved_commit = str(metadata.get("source_commit") or "")
+                running_commit = str(source_commit or "")
+                if saved_commit and running_commit and saved_commit != running_commit:
+                    raise RuntimeError(
+                        "checkpoint code commit "
+                        f"{saved_commit[:12]} does not match running commit "
+                        f"{running_commit[:12]}"
+                    )
+                if not saved_commit or not running_commit:
+                    warnings.append(
+                        "code commit unknown on one side; continuing without a code check"
+                    )
+                trainer.restore(params, optimizer_state)
+                del params, optimizer_state
+                trainer.step = step
+                trainer.batches.restore(cursor)
+                resumed_from_step = step
+                log(f"resumed {config.run_id} at step {step}")
+        finally:
+            shutil.rmtree(restore_dir, ignore_errors=True)
     metrics = [
         record
         for record in metrics
@@ -296,9 +302,13 @@ def run_session(
                 ]
             )
         )
+        elapsed = time.monotonic() - started
         peak = peak_memory_gib()
         records: list[dict[str, Any]] = []
         for index, (step, _, _, tokens, step_elapsed) in enumerate(pending):
+            last_in_window = index == len(pending) - 1
+            if last_in_window:
+                step_elapsed = elapsed
             record: dict[str, Any] = {
                 "step": step,
                 "loss": float(values[0, index]),
@@ -311,7 +321,7 @@ def run_session(
             }
             if peak is not None:
                 record["peak_hbm_gib"] = peak
-            if index == len(pending) - 1 and step_elapsed > last_elapsed:
+            if last_in_window and step_elapsed > last_elapsed:
                 record["tokens_per_second"] = (tokens - last_tokens) / (
                     step_elapsed - last_elapsed
                 )
@@ -319,7 +329,7 @@ def run_session(
         losses.extend(record["loss"] for record in records)
         metrics.extend(records)
         last_tokens = float(pending[-1][3])
-        last_elapsed = pending[-1][4]
+        last_elapsed = elapsed
         pending.clear()
         return records
 
@@ -597,6 +607,7 @@ def _persist(
         "preset": preset.to_dict(),
         "source_commit": source_commit,
         "tokenizer_sha256": corpus.tokenizer_sha256,
+        "corpus_sha256": corpus.manifest_sha256,
         "param_count": preset.num_parameters,
     }
     if not local.exists():

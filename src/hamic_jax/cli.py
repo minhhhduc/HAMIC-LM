@@ -68,9 +68,13 @@ def _train(args: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     limit = args.steps if args.steps is not None else config.total_steps
     metadata = {
+        "backend": "jax",
         "run_id": config.run_id,
         "identity": config.identity(),
         "preset": preset.to_dict(),
+        "source_commit": "",
+        "tokenizer_sha256": corpus.tokenizer_sha256,
+        "corpus_sha256": corpus.manifest_sha256,
     }
     for _ in range(limit):
         loss = trainer.train_step()

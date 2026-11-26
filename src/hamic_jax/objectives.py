@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import itertools
 import math
+import unicodedata
+from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
 
-from hamic_jax.spec import SpecialTokens
+from hamic_jax.spec import SpecialTokens, read_yaml
 
 __all__ = [
     "CLMObjective",
@@ -30,6 +33,7 @@ __all__ = [
     "SpanUnits",
     "TokenClasses",
     "TokenUnits",
+    "VariantTable",
     "WholeWordUnits",
     "mine_pmi_ngrams",
     "mine_pmi_pairs",
@@ -474,6 +478,69 @@ class NgramUnits:
         starts = ~joined
         return np.cumsum(starts, axis=1) - 1
 
+@dataclass(frozen=True)
+class VariantTable:
+    """Existing single-token Vietnamese variants, indexed by original token ID."""
+
+    offsets: np.ndarray[Any, Any]
+    values: np.ndarray[Any, Any]
+
+    @classmethod
+    def from_vocabulary(cls, tokens: list[str]) -> VariantTable:
+        """Build case, tone, diacritic and lexicon variants without importing Torch."""
+        lexicon = read_yaml(Path(__file__).parents[1] / "hamic/resources/teencode.yaml")
+        words = lexicon.get("words", {})
+        tone_marks = frozenset("̣̀́̃̉")
+        lookup: dict[str, int] = {}
+        tones: dict[str, list[int]] = defaultdict(list)
+        keys: dict[int, str] = {}
+        for index, text in enumerate(tokens):
+            if text.removeprefix(" ").isalpha():
+                lookup.setdefault(text, index)
+                key = unicodedata.normalize("NFC", "".join(
+                    c for c in unicodedata.normalize("NFD", text) if c not in tone_marks
+                ))
+                keys[index] = key
+                tones[key].append(index)
+        offsets = [0]
+        values: list[int] = []
+        for index, text in enumerate(tokens):
+            if index in keys:
+                core = text.removeprefix(" ")
+                space = text[:len(text) - len(core)]
+                plain = "".join(
+                    c for c in unicodedata.normalize("NFD", core)
+                    if unicodedata.category(c) != "Mn"
+                ).translate(str.maketrans("đĐ", "dD"))
+                forms = {plain, core.lower(), core.upper(), core.capitalize()}
+                if variants := words.get(core.lower()):
+                    variant = str(variants[0])
+                    forms.add(variant[:1].upper() + variant[1:] if core[0].isupper() else variant)
+                found = set(tones[keys[index]])
+                found.update(lookup[space + form] for form in forms if space + form in lookup)
+                found.discard(index)
+                values.extend(sorted(found))
+            offsets.append(len(values))
+        return cls(np.asarray(offsets, dtype=np.int64), np.asarray(values, dtype=np.int64))
+
+    @classmethod
+    def from_tokenizer_file(cls, path: str | Path) -> VariantTable:
+        """Decode the vocabulary and build the table once before training."""
+        return cls.from_vocabulary(_decoded_vocabulary(path))
+
+    def sample(
+        self, ids: np.ndarray[Any, Any], uniform: np.ndarray[Any, Any]
+    ) -> tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]:
+        """Pick a variant where one exists, leaving other IDs unchanged."""
+        start = self.offsets[ids]
+        count = self.offsets[ids + 1] - start
+        available = count > 0
+        result = ids.copy()
+        pick = (uniform[available] * count[available]).astype(np.int64)
+        result[available] = self.values[start[available] + pick]
+        return result, available
+
+
 @dataclass
 class MLMObjective:
     """Dynamic MLM masking with deterministic per-step randomness."""
@@ -488,6 +555,7 @@ class MLMObjective:
     mask_share: float = 0.8
     random_share: float = 0.1
     variant_share: float = 0.0
+    variants: VariantTable | None = None
     masking: str = "token"
     span_max_length: int = 5
     pmi_pairs: np.ndarray[Any, Any] | None = None
@@ -510,8 +578,10 @@ class MLMObjective:
             raise ValueError("whole-word masking needs token classes")
         if self.mask_share + self.random_share > 1:
             raise ValueError("mask_share + random_share must be <= 1")
-        if self.variant_share:
-            raise ValueError("v1 JAX backend does not carry a spelling-variant table")
+        if not 0 <= self.variant_share <= self.mask_share + self.random_share:
+            raise ValueError("variant_share must be in [0, mask_share + random_share]")
+        if self.variant_share and self.variants is None:
+            raise ValueError("variant_share needs a spelling-variant table")
 
     def rate_at(self, step: int) -> float:
         """Mask rate at a global micro-step."""
@@ -567,9 +637,16 @@ class MLMObjective:
             self.special.first_regular_id, self.vocab_size, size=ids.shape, dtype=np.int64
         )
         masked = ids.copy()
-        random_end = self.mask_share + self.random_share
-        to_mask = selected & (action < self.mask_share)
-        to_random = selected & (action >= self.mask_share) & (action < random_end)
+        taken_from_random = min(self.variant_share, self.random_share)
+        mask_end = self.mask_share - (self.variant_share - taken_from_random)
+        random_end = mask_end + (self.random_share - taken_from_random)
+        to_mask = selected & (action < mask_end)
+        to_random = selected & (action >= mask_end) & (action < random_end)
+        if self.variant_share and self.variants is not None:
+            to_variant = selected & (action >= random_end) & (action < random_end + self.variant_share)
+            variants, available = self.variants.sample(ids, rng.random(ids.shape))
+            masked[to_variant & available] = variants[to_variant & available]
+            to_random |= to_variant & ~available
         masked[to_mask] = self.special.mask_id
         masked[to_random] = random_ids[to_random]
         return MaskedBatch(input_ids=masked, labels=labels)

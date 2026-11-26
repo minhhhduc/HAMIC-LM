@@ -221,7 +221,7 @@ def forward(
         document_mask: Restrict attention to the document that starts at each bos token.
         objective: ``"mlm"`` or ``"clm"``. Defaults by architecture.
         special: Special-token ids; defaults to HAMIC's fixed layout.
-        attention_impl: ``xla`` (fused), ``sdpa``/``flex_attention`` (fused aliases), or
+        attention_impl: ``xla`` (dense), ``sdpa``/``flex_attention`` (XLA aliases), or
             ``reference`` (explicit fp32 audit path).
         recompute: Rematerialise each transformer block in the backward pass. It trades
             compute for activation memory, which is what keeps the larger presets inside

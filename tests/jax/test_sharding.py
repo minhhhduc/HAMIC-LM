@@ -19,6 +19,14 @@ def test_layout_picks_a_divisor_and_rejects_zero() -> None:
     assert layout.mesh.devices.size == layout.data_parallel
 
 
+def test_eval_sharding_keeps_each_sequence_whole() -> None:
+    layout = DeviceLayout.for_batch(6)
+    batch = layout.place_batch(np.zeros((6, 5), np.int32))
+    assert batch.sharding.spec == P("data", None)
+    for shard in batch.addressable_shards:
+        assert shard.data.shape == (6 // layout.data_parallel, 5)
+
+
 def test_stack_sharding_keeps_the_accumulation_axis_replicated() -> None:
     """Sharding the accumulation axis would give each chip a different micro-step."""
     layout = DeviceLayout.for_batch(6)

@@ -3,9 +3,8 @@
 Every optimizer step shards the packed batch over the local chips. Parameters and
 optimizer state are replicated: a v5e-8 has 16 GiB per chip, which holds the full
 fp32 state of every public pretraining preset up to ``hamic-d500m``. The batch is
-split only along the ``data`` mesh axis, and each shard computes the same gradient
-after an explicit all-reduce, so the update is identical to a single-device run of
-the same global batch.
+split only along the ``data`` mesh axis. The all-reduce combines gradients weighted by
+valid-token counts to recover the full micro-batch objective.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -61,7 +59,7 @@ class DeviceLayout:
     @property
     def batch_sharding(self) -> NamedSharding:
         """Sharding for ``[batch, seq]`` inputs: split the batch over the mesh."""
-        return NamedSharding(self.mesh, P(None, "data"))
+        return NamedSharding(self.mesh, P("data", None))
 
     @property
     def stack_sharding(self) -> NamedSharding:
@@ -89,12 +87,12 @@ class DeviceLayout:
 
     def place_batch(self, rows: Any) -> jax.Array:
         """Place one host batch on the mesh, sharded along its first axis."""
-        array = rows if isinstance(rows, jax.Array) else jnp.asarray(rows, dtype=jnp.int32)
+        array = rows if isinstance(rows, jax.Array) else np.asarray(rows, dtype=np.int32)
         return jax.device_put(array, self.batch_sharding)
 
     def place_stack(self, rows: Any) -> jax.Array:
         """Place ``[accum, batch, seq]`` training input, splitting the batch axis."""
-        array = rows if isinstance(rows, jax.Array) else jnp.asarray(rows, dtype=jnp.int32)
+        array = rows if isinstance(rows, jax.Array) else np.asarray(rows, dtype=np.int32)
         return jax.device_put(array, self.stack_sharding)
 
 

@@ -118,7 +118,9 @@ def _verify(directory: Path) -> dict[str, Any]:
             raise CheckpointError(f"missing or truncated payload: {entry['path']}")
         if _sha256(path) != entry["sha256"]:
             raise CheckpointError(f"sha256 mismatch: {entry['path']}")
-    return manifest["metadata"]
+    if not any(entry["path"] == META_NAME for entry in manifest["files"]):
+        raise CheckpointError("checkpoint manifest has no state metadata")
+    return json.loads((directory / META_NAME).read_bytes())
 
 
 def save_checkpoint(
@@ -133,27 +135,32 @@ def save_checkpoint(
     root = Path(directory)
     if root.exists():
         raise FileExistsError(f"{root} already exists")
-    root.mkdir(parents=True)
-    save_file({name: np.asarray(value) for name, value in params.items()}, root / PARAMS_NAME)
-    leaves, _ = jax.tree_util.tree_flatten(optimizer_state)
-    save_file(
-        {f"opt_{index:05d}": np.asarray(leaf) for index, leaf in enumerate(leaves)},
-        root / OPTIMIZER_NAME,
-    )
-    meta = {
-        "step": int(step),
-        "cursor": cursor.to_dict(),
-        "optimizer_leaves": len(leaves),
-        "metadata": dict(metadata),
-    }
-    _atomic_json(root / META_NAME, meta)
-    manifest = _write_manifest(root, meta)
-    marker = {
-        "schema_version": SCHEMA_VERSION,
-        "manifest_sha256": _sha256(root / MANIFEST_NAME),
-        "files": len(manifest["files"]),
-    }
-    _atomic_json(root / COMMIT_NAME, marker)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{root.name}-", dir=root.parent) as temporary:
+        staging = Path(temporary) / root.name
+        staging.mkdir()
+        save_file(
+            {name: np.asarray(value) for name, value in params.items()}, staging / PARAMS_NAME
+        )
+        leaves, _ = jax.tree_util.tree_flatten(optimizer_state)
+        save_file(
+            {f"opt_{index:05d}": np.asarray(leaf) for index, leaf in enumerate(leaves)},
+            staging / OPTIMIZER_NAME,
+        )
+        meta = {
+            "step": int(step),
+            "cursor": cursor.to_dict(),
+            "optimizer_leaves": len(leaves),
+            "metadata": dict(metadata),
+        }
+        _atomic_json(staging / META_NAME, meta)
+        manifest = _write_manifest(staging, meta)
+        _atomic_json(staging / COMMIT_NAME, {
+            "schema_version": SCHEMA_VERSION,
+            "manifest_sha256": _sha256(staging / MANIFEST_NAME),
+            "files": len(manifest["files"]),
+        })
+        staging.rename(root)
     return root
 
 
@@ -172,17 +179,14 @@ def load_checkpoint(
     params = load_file(root / PARAMS_NAME)
     optimizer_state: Any = None
     if optimizer is not None:
-        template = optimizer.init(params)
+        template = jax.eval_shape(optimizer.init, params)
         treedef = jax.tree_util.tree_flatten(template)[1]
         saved = load_file(root / OPTIMIZER_NAME)
         count = int(meta["optimizer_leaves"])
         if len(saved) != count:
             raise CheckpointError("optimizer leaf count does not match metadata")
         leaves = [saved[f"opt_{index:05d}"] for index in range(count)]
-        optimizer_state = jax.tree.map(
-            lambda leaf: jax.numpy.asarray(leaf),
-            jax.tree_util.tree_unflatten(treedef, leaves),
-        )
+        optimizer_state = jax.tree_util.tree_unflatten(treedef, leaves)
     cursor = DataCursor.from_dict(meta["cursor"])
     return params, optimizer_state, int(meta["step"]), cursor, dict(meta["metadata"])
 
@@ -450,9 +454,17 @@ class CheckpointPublisher:
         prefix = f"{self.run_prefix}/checkpoints/{name}"
         if self.store.read_bytes(f"{prefix}/{COMMIT_NAME}") is not None:
             raise CheckpointError(f"{prefix} is already committed")
-        entries = _write_manifest(root, metadata)["files"]
-        files = {f"{prefix}/{entry['path']}": root / entry["path"] for entry in entries}
-        files[f"{prefix}/{MANIFEST_NAME}"] = root / MANIFEST_NAME
+        manifest_path = root / MANIFEST_NAME
+        manifest_hash = _sha256(manifest_path)
+        marker = json.loads((root / COMMIT_NAME).read_bytes())
+        if marker.get("manifest_sha256") != manifest_hash:
+            raise CheckpointError("local manifest hash does not match COMMITTED.json")
+        manifest = json.loads(manifest_path.read_bytes())
+        saved = manifest["metadata"]
+        if saved["step"] != int(metadata["step"]) or saved["metadata"] != dict(metadata):
+            raise CheckpointError("local checkpoint metadata does not match the run")
+        files = {f"{prefix}/{entry['path']}": root / entry["path"] for entry in manifest["files"]}
+        files[f"{prefix}/{MANIFEST_NAME}"] = manifest_path
         self.store.put_files(files, message=f"checkpoint payload {name}")
         sizes = self.store.stat(list(files))
         for remote, local in files.items():
@@ -460,7 +472,7 @@ class CheckpointPublisher:
                 raise CheckpointError(f"remote file missing or truncated: {remote}")
         marker = {
             "schema_version": SCHEMA_VERSION,
-            "manifest_sha256": _sha256(root / MANIFEST_NAME),
+            "manifest_sha256": manifest_hash,
         }
         self.store.put_bytes(
             f"{prefix}/{COMMIT_NAME}", json.dumps(marker).encode(), f"commit {name}"
@@ -491,7 +503,9 @@ class CheckpointResolver:
             raw = self.store.read_bytes(f"{prefix}/{MANIFEST_NAME}")
             if raw is None:
                 continue
-            metadata = json.loads(raw)["metadata"]
+            saved = json.loads(raw)["metadata"]
+            # Older remote manifests stored the run metadata without the state wrapper.
+            metadata = {**saved.get("metadata", saved), "step": saved["step"]}
             found.append(RemoteCheckpoint(prefix=prefix, metadata=metadata))
         return sorted(found, key=lambda item: item.step)
 
@@ -503,10 +517,11 @@ class CheckpointResolver:
         return target
 
     def restore_latest(self, destination: str | Path) -> RemoteCheckpoint | None:
-        """Download the newest valid checkpoint, or ``None``."""
+        """Download the newest valid checkpoint, or ``None`` if no checkpoints exist."""
         final = Path(destination)
         final.parent.mkdir(parents=True, exist_ok=True)
-        for candidate in reversed(self.committed()):
+        candidates = self.committed()
+        for candidate in reversed(candidates):
             with tempfile.TemporaryDirectory(dir=final.parent) as staging:
                 try:
                     staged = self.download(candidate, Path(staging) / "ckpt")
@@ -516,4 +531,6 @@ class CheckpointResolver:
                     raise FileExistsError(final)
                 staged.rename(final)
                 return candidate
+        if candidates:
+            raise CheckpointError(f"No valid committed checkpoint under {self.run_prefix!r}")
         return None

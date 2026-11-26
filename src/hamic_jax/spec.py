@@ -248,6 +248,8 @@ class TrainingConfig:
             raise ValueError("lr_schedule must be 'cosine' or 'wsd'")
         if self.masking not in ("token", "span", "pmi", "pmi_ngram"):
             raise ValueError("unsupported masking policy")
+        if not 0 <= self.variant_share <= 0.9 or (self.variant_share and self.objective != "mlm"):
+            raise ValueError("variant_share must be in [0, 0.9] and is only supported for MLM")
         if self.attention not in ("sdpa", "flex_attention", "xla", "reference"):
             raise ValueError("attention must be sdpa, flex_attention, xla or reference")
         if not 2 <= self.pmi_max_ngram <= 3:
@@ -275,9 +277,7 @@ class TrainingConfig:
     def identity(self) -> dict[str, Any]:
         """Fields that define the trajectory and therefore gate strict resume."""
         return {
-            "run_id": self.run_id,
             "model_preset": self.model_preset,
-            "tokenized": self.tokenized,
             "objective": self.objective,
             "seq_len": self.seq_len,
             "micro_batch_size": self.micro_batch_size,
@@ -292,7 +292,29 @@ class TrainingConfig:
             "seed": self.seed,
             "lr_schedule": self.lr_schedule,
             "decay_ratio": self.decay_ratio,
+            "cross_document_attention": self.cross_document_attention,
             "source_weights": dict(sorted(self.source_weights.items())),
+            "precision": self.precision,
+            "attention": "reference" if self.attention == "reference" else "xla",
+            "shuffle": self.shuffle,
+            "mask_rate": self.mask_rate,
+            "mask_rate_final": self.mask_rate_final,
+            "mask_schedule_start": self.mask_schedule_start,
+            "masking": self.masking,
+            "span_max_length": self.span_max_length,
+            "pmi_unit_share": self.pmi_unit_share,
+            "pmi_max_tokens": self.pmi_max_tokens,
+            "pmi_min_count": self.pmi_min_count,
+            "pmi_min_pmi": self.pmi_min_pmi,
+            "pmi_max_pairs": self.pmi_max_pairs,
+            "pmi_max_ngram": self.pmi_max_ngram,
+            "pmi_min_doc_count": self.pmi_min_doc_count,
+            "pmi_max_extension_share": self.pmi_max_extension_share,
+            "pmi_discount_k": self.pmi_discount_k,
+            "pmi_chunk_tokens": self.pmi_chunk_tokens,
+            "pmi_max_unit_length": self.pmi_max_unit_length,
+            "whole_word_masking": self.whole_word_masking,
+            "variant_share": self.variant_share,
         }
 
 

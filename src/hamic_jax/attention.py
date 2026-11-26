@@ -1,8 +1,7 @@
 """Attention masks and scaled dot-product attention.
 
-The default implementation is XLA's fused attention primitive, which is the only
-attention kernel available on v5e. ``reference`` is an explicit fp32 softmax used to
-audit the fused path; it is slower and no production config selects it.
+The default is JAX's dense XLA implementation. ``reference`` is an explicit fp32
+softmax used to audit it; production configs do not select it.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ __all__ = [
 
 Array = jax.Array
 
-_FUSED_ALIASES = ("xla", "sdpa", "flex_attention")
+_XLA_ALIASES = ("xla", "sdpa", "flex_attention")
 
 
 def encoder_mask(
@@ -37,8 +36,7 @@ def encoder_mask(
     valid = (input_ids != pad_id) if attention_mask is None else attention_mask.astype(bool)
     mask = valid[:, None, :] & valid[:, :, None]
     if document_mask:
-        document = jnp.cumsum(input_ids == bos_id, axis=1) - 1
-        document = jnp.maximum(document, 0)
+        document = jnp.cumsum(input_ids == bos_id, axis=1)
         mask = mask & (document[:, :, None] == document[:, None, :])
     return mask[:, None, :, :]
 
@@ -60,8 +58,7 @@ def decoder_mask(
     seq_len = input_ids.shape[1]
     mask = causal_mask(seq_len) & valid[:, None, None, :]
     if document_mask:
-        document = jnp.cumsum(input_ids == bos_id, axis=1) - 1
-        document = jnp.maximum(document, 0)
+        document = jnp.cumsum(input_ids == bos_id, axis=1)
         mask = mask & (document[:, :, None] == document[:, None, :])[:, None, :, :]
     return mask
 
@@ -73,7 +70,7 @@ def _reference_attention(
     mask: Array | None,
     scale: float | None,
 ) -> Array:
-    """Materialise logits and softmax in fp32; a slow audit of the fused kernel."""
+    """Materialize logits and softmax in fp32 for comparison with JAX XLA."""
     if key.shape[2] != query.shape[2]:
         repeat = query.shape[2] // key.shape[2]
         key = jnp.repeat(key, repeat, axis=2)
@@ -86,10 +83,11 @@ def _reference_attention(
     )
     logits = logits * factor
     if mask is not None:
-        # Padding rows can be fully masked. Attending to every key there keeps the
-        # softmax finite; their outputs are ignored by the loss.
+        # Padding rows can be fully masked. XLA's primitive gives such a row a uniform
+        # average of the values instead of a NaN, so flatten its logits to zero as well.
         empty = ~jnp.any(mask, axis=-1, keepdims=True)
-        logits = jnp.where(mask | empty, logits, jnp.finfo(jnp.float32).min)
+        logits = jnp.where(mask, logits, jnp.finfo(jnp.float32).min)
+        logits = jnp.where(empty, 0.0, logits)
     weights = jax.nn.softmax(logits, axis=-1)
     context = jnp.einsum("bhqk,bkhd->bqhd", weights, value.astype(jnp.float32))
     return context.astype(value.dtype)
@@ -106,21 +104,20 @@ def attention(
 ) -> Array:
     """Scaled dot-product attention over ``[batch, seq, heads, dim]`` arrays.
 
-    ``jax.nn.dot_product_attention`` is XLA's attention primitive: it keeps the logits in
-    float32, applies the mask with a finite dtype minimum, and lets XLA fuse the matmuls
-    and softmax on TPU. It also discovers grouped-query attention from the head counts,
-    so the decoder never materialises ``repeat_kv``. TPU v5e has no FlexAttention kernel;
-    the config's ``flex_attention`` and ``sdpa`` both resolve to this primitive, while
+    The JAX XLA implementation supports grouped-query attention directly from the
+    head counts, so the decoder does not materialize ``repeat_kv``. The GPU config
+    names ``flex_attention`` and ``sdpa`` both select the dense XLA path here;
     ``reference`` runs the explicit audit path above.
 
-    HF eager attention multiplies the logits by ``head_dim ** -0.5``; the fused primitive
-    does the same, after the QK product, which keeps the fp32 rounding order.
+    Both HF eager attention and this path apply ``head_dim ** -0.5`` after the QK product.
     """
-    if implementation in _FUSED_ALIASES:
-        return jax.nn.dot_product_attention(query, key, value, mask=mask, scale=scale)
+    if implementation in _XLA_ALIASES:
+        return jax.nn.dot_product_attention(
+            query, key, value, mask=mask, scale=scale, implementation="xla"
+        )
     if implementation == "reference":
         return _reference_attention(query, key, value, mask, scale)
     raise ValueError(
         f"unknown attention implementation {implementation!r}; "
-        f"use one of {_FUSED_ALIASES + ('reference',)}"
+        f"use one of {_XLA_ALIASES + ('reference',)}"
     )

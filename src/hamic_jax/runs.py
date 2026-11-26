@@ -92,6 +92,8 @@ def write_run_manifest(
             )
         if stored.get("identity") != manifest.get("identity"):
             raise RuntimeError(f"run {run_id!r} exists with a different training identity")
+        if stored.get("corpus_sha256") != manifest.get("corpus_sha256"):
+            raise RuntimeError(f"run {run_id!r} exists with a different tokenized corpus")
         old_commit = stored.get("source_commit")
         new_commit = manifest.get("source_commit")
         if old_commit and new_commit and old_commit != new_commit:
