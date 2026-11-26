@@ -77,6 +77,42 @@ class SessionReport:
     paused: bool
     seconds: float
 
+    @property
+    def status(self) -> str:
+        """Terminal status of the session."""
+        if self.completed:
+            return "completed"
+        return "paused" if self.paused else "stopped"
+
+    @property
+    def final_step(self) -> int:
+        """Step reached by the session."""
+        return self.step
+
+    @property
+    def published_steps(self) -> int:
+        """Number of checkpoints published by the session."""
+        return len(self.checkpoints)
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """Non-fatal warnings; the JAX session currently emits none."""
+        return ()
+
+    @property
+    def evaluations(self) -> dict[int, float]:
+        """Evaluation loss keyed by step."""
+        return {
+            int(record["step"]): float(record["eval_loss"])
+            for record in self.metrics
+            if "eval_loss" in record
+        }
+
+    @property
+    def eval_bits_per_byte(self) -> dict[int, float]:
+        """Bits-per-byte by step; not tracked by the JAX evaluator."""
+        return {}
+
 
 @dataclass(frozen=True)
 class SmokeReport:
@@ -193,6 +229,8 @@ def run_session(
     deadline = None if limits.seconds is None else started + limits.seconds
     last_checkpoint_step = resumed_from_step
     last_checkpoint_time = time.monotonic()
+    last_tokens = float(trainer.batches.consumed_tokens)
+    last_elapsed = 0.0
     paused = False
 
     while trainer.step < target:
@@ -201,12 +239,19 @@ def run_session(
             break
         losses.append(float(trainer.train_step()))
         now = time.monotonic()
+        elapsed = now - started
         record = {
             "step": trainer.step,
             "loss": losses[-1],
             "tokens": trainer.batches.consumed_tokens,
-            "elapsed_seconds": round(now - started, 3),
+            "elapsed_seconds": round(elapsed, 3),
         }
+        if elapsed > last_elapsed:
+            record["tokens_per_second"] = (record["tokens"] - last_tokens) / (
+                elapsed - last_elapsed
+            )
+        last_tokens = float(record["tokens"])
+        last_elapsed = elapsed
         if limits.eval_every_steps and trainer.step % limits.eval_every_steps == 0:
             record["eval_loss"] = evaluate(
                 config,
