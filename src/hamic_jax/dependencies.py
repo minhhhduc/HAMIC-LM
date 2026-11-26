@@ -16,7 +16,8 @@ _BASE = {
     "yaml": "pyyaml",
     "tokenizers": "tokenizers",
     "matplotlib": "matplotlib",
-    "tqdm": "tqdm",
+    "ipywidgets": "ipywidgets",
+    "pandas": "pandas",
 }
 _DOWNSTREAM = {
     "transformers": "transformers",

@@ -31,6 +31,7 @@ from hamic_jax.checkpoint import (
 )
 from hamic_jax.data import TokenizedCorpus, tokenized_prefix
 from hamic_jax.runs import (
+    COMPLETE_NAME,
     mark_complete,
     publish_metrics,
     run_prefix,
@@ -76,12 +77,18 @@ class SessionReport:
     completed: bool
     paused: bool
     seconds: float
+    interrupted: bool = False
+    already_complete: bool = False
 
     @property
     def status(self) -> str:
         """Terminal status of the session."""
+        if self.already_complete:
+            return "already_complete"
         if self.completed:
             return "completed"
+        if self.interrupted:
+            return "interrupted"
         return "paused" if self.paused else "stopped"
 
     @property
@@ -90,28 +97,38 @@ class SessionReport:
         return self.step
 
     @property
-    def published_steps(self) -> int:
-        """Number of checkpoints published by the session."""
-        return len(self.checkpoints)
+    def published_steps(self) -> list[int]:
+        """Steps whose checkpoints this session committed."""
+        return [
+            int(Path(name).name.removeprefix("step-"))
+            for name in self.checkpoints
+            if Path(name).name.startswith("step-")
+        ]
 
     @property
-    def warnings(self) -> tuple[str, ...]:
+    def warnings(self) -> list[str]:
         """Non-fatal warnings; the JAX session currently emits none."""
-        return ()
+        return []
 
     @property
     def evaluations(self) -> dict[int, float]:
-        """Evaluation loss keyed by step."""
+        """Evaluation loss keyed by step for this session only."""
+        start = self.resumed_from_step or 0
         return {
             int(record["step"]): float(record["eval_loss"])
             for record in self.metrics
-            if "eval_loss" in record
+            if "eval_loss" in record and int(record.get("step", 0)) > start
         }
 
     @property
     def eval_bits_per_byte(self) -> dict[int, float]:
-        """Bits-per-byte by step; not tracked by the JAX evaluator."""
-        return {}
+        """Bits-per-byte by step for this session; empty until the evaluator tracks it."""
+        start = self.resumed_from_step or 0
+        return {
+            int(record["step"]): float(record["eval_bpb"])
+            for record in self.metrics
+            if "eval_bpb" in record and int(record.get("step", 0)) > start
+        }
 
 
 @dataclass(frozen=True)
@@ -168,6 +185,21 @@ def run_session(
     root = Path(workdir)
     root.mkdir(parents=True, exist_ok=True)
     prefix = run_prefix(config.run_id)
+    if publish:
+        assert store is not None
+        if store.read_bytes(f"{prefix}/{COMPLETE_NAME}") is not None:
+            return SessionReport(
+                run_id=config.run_id,
+                step=config.total_steps,
+                resumed_from_step=None,
+                losses=(),
+                metrics=(),
+                checkpoints=(),
+                completed=True,
+                paused=False,
+                seconds=0.0,
+                already_complete=True,
+            )
     started = time.monotonic()
     losses: list[float] = []
     metrics: list[dict[str, Any]] = _load_metrics(root, store, prefix, publish)
@@ -295,6 +327,11 @@ def run_session(
                 _publish_metrics(root, store, config.run_id, metrics, publish)
 
     completed = trainer.step >= total_steps
+    interrupted = bool(
+        limits.steps is not None
+        and trainer.step >= limits.steps
+        and trainer.step < total_steps
+    )
     if (
         limits.checkpoint_at_end
         and trainer.step > 0
@@ -334,10 +371,11 @@ def run_session(
                 f"complete {config.run_id}",
             )
         else:
+            status = "paused" if paused else ("interrupted" if interrupted else "stopped")
             write_status(
                 store,
                 config.run_id,
-                {**payload, "status": "paused" if paused else "stopped"},
+                {**payload, "status": status},
                 f"status {config.run_id}",
             )
 
@@ -351,6 +389,7 @@ def run_session(
         completed=completed,
         paused=paused,
         seconds=time.monotonic() - started,
+        interrupted=interrupted,
     )
 
 
