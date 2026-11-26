@@ -27,6 +27,8 @@ import hamic_jax.objectives
 import hamic_jax.optim
 import hamic_jax.params
 import hamic_jax.presets
+import hamic_jax.session
+import hamic_jax.sharding
 import hamic_jax.train
 assert "torch" not in sys.modules, "torch was imported"
 assert "hamic" not in sys.modules, "the GPU package was imported"
