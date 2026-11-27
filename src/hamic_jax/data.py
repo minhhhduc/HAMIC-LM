@@ -224,7 +224,18 @@ def fetch_tokenized(
     target.parent.mkdir(parents=True, exist_ok=True)
     store.download_prefix(prefix, target)
     corpus = TokenizedCorpus(target)
-    corpus.verify()
+    try:
+        corpus.verify()
+    except FileNotFoundError as exc:
+        present = sorted(
+            p.relative_to(target).as_posix()
+            for p in target.rglob("*")
+            if p.is_file()
+        )
+        shutil.rmtree(target, ignore_errors=True)
+        raise FileNotFoundError(
+            f"{exc} (downloaded {len(present)} file(s) under {prefix!r}: {present[:10]})"
+        ) from exc
     return corpus
 
 

@@ -367,31 +367,75 @@ class HuggingFaceObjectStore:
     ) -> Path:
         """Download every file under ``prefix`` into ``destination``.
 
-        ``snapshot_download`` writes ``<local_dir>/<prefix>/...``. The staged tree is
-        renamed so the caller receives the contents of ``prefix`` at ``destination``,
-        which is the contract ``CheckpointResolver`` and ``fetch_tokenized`` rely on.
+        Lists the exact recursive tree under ``prefix`` rather than relying on
+        ``snapshot_download`` glob patterns, then downloads every file into a
+        sibling staging directory and atomically renames ``<staging>/<prefix>``
+        to ``destination``.
         """
-        from huggingface_hub import snapshot_download
+        from concurrent.futures import ThreadPoolExecutor
+
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import EntryNotFoundError, RemoteEntryNotFoundError
+        from huggingface_hub.hf_api import RepoFile
 
         if destination.exists():
             raise FileExistsError(f"Destination already exists: {destination}")
+        clean = prefix.rstrip("/")
+        revision = self._api.repo_info(
+            self.repo_id, repo_type=self.repo_type
+        ).sha
+        try:
+            entries = self._api.list_repo_tree(
+                self.repo_id,
+                path_in_repo=clean,
+                recursive=True,
+                revision=revision,
+                repo_type=self.repo_type,
+            )
+            remote_files = sorted(
+                entry.path for entry in entries if isinstance(entry, RepoFile)
+            )
+        except (EntryNotFoundError, RemoteEntryNotFoundError) as exc:
+            raise FileNotFoundError(
+                f"Nothing found under {prefix!r} in {self.repo_id}"
+            ) from exc
+        if not remote_files:
+            raise FileNotFoundError(
+                f"Nothing found under {prefix!r} in {self.repo_id}"
+            )
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(
             tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
         )
         try:
-            snapshot_download(
-                self.repo_id,
-                repo_type=self.repo_type,
-                allow_patterns=[f"{prefix.rstrip('/')}/*"],
-                local_dir=staging,
-                token=self._token,
-                max_workers=max_workers,
-            )
-            source = staging / prefix.rstrip("/")
+            def _fetch(remote_path: str) -> None:
+                hf_hub_download(
+                    self.repo_id,
+                    filename=remote_path,
+                    repo_type=self.repo_type,
+                    revision=revision,
+                    local_dir=staging,
+                    token=self._token,
+                )
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                list(pool.map(_fetch, remote_files))
+
+            source = staging / clean
             if not source.is_dir():
                 raise FileNotFoundError(
                     f"Nothing found under {prefix!r} in {self.repo_id}"
+                )
+            missing = [
+                remote_path
+                for remote_path in remote_files
+                if not (staging / remote_path).is_file()
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    f"Incomplete download under {prefix!r} in {self.repo_id}: "
+                    f"missing {len(missing)}/{len(remote_files)} file(s), "
+                    f"first={missing[0]!r}"
                 )
             os.replace(source, destination)
         finally:
