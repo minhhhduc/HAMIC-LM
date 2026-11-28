@@ -665,19 +665,18 @@ def evaluate_metrics(
             )
 
     if show_progress:
-        from tqdm import tqdm
+        from hamic_jax.progress import ProgressBar
 
-        with tqdm(
-            range(num_batches),
+        with ProgressBar(
             total=num_batches,
             desc=progress_desc or "eval",
             unit="batch",
-            dynamic_ncols=True,
             leave=False,
         ) as bar:
-            for index in bar:
+            for index in range(num_batches):
                 _run_batch(index)
                 bar.set_postfix(loss=f"{float(np.mean(losses)):.4f}", refresh=False)
+                bar.update(1)
     else:
         for index in range(num_batches):
             _run_batch(index)

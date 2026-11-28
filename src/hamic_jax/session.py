@@ -362,16 +362,15 @@ def run_session(
 
     try:
         if show_progress:
-            from tqdm import tqdm
+            from hamic_jax.progress import ProgressBar
 
-            train_bar = tqdm(
+            train_bar = ProgressBar(
                 total=target,
                 initial=trainer.step,
                 desc=f"train {config.run_id}",
                 unit="step",
-                dynamic_ncols=True,
+                postfix="compiling...",
             )
-            train_bar.set_postfix_str("compiling...")
         last_eval_loss: float | None = None
         first_step = True
 
@@ -394,8 +393,6 @@ def run_session(
                         now - started,
                     )
                 )
-                if train_bar is not None:
-                    train_bar.update(1)
                 due_eval = bool(
                     limits.eval_every_steps
                     and trainer.step % limits.eval_every_steps == 0
@@ -436,11 +433,12 @@ def run_session(
                     progress(trainer.step, target, float(current["loss"]))
                 if due_log:
                     assert current is not None
-                    _emit(
-                        f"step {trainer.step}/{target} loss {current['loss']:.5f} "
-                        f"lr {current['lr']:.3g} |g| {current['grad_norm']:.3f} "
-                        f"tokens {current['tokens']}"
-                    )
+                    if train_bar is None or log is not print:
+                        _emit(
+                            f"step {trainer.step}/{target} loss {current['loss']:.5f} "
+                            f"lr {current['lr']:.3g} |g| {current['grad_norm']:.3f} "
+                            f"tokens {current['tokens']}"
+                        )
                 if train_bar is not None:
                     if current is not None:
                         postfix: dict[str, str] = {
@@ -454,6 +452,7 @@ def run_session(
                         train_bar.set_postfix(postfix, refresh=False)
                     elif first_step:
                         train_bar.set_postfix_str("running", refresh=False)
+                    train_bar.update(1)
                 first_step = False
                 now = time.monotonic()
                 due_steps = bool(
