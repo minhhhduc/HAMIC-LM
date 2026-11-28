@@ -41,7 +41,7 @@ def rope_tables(
     positions = jnp.arange(offset, offset + seq_len, dtype=jnp.float32)
     freqs = positions[:, None] * inv_freq[None, :]
     emb = jnp.concatenate((freqs, freqs), axis=-1)
-    return RopeTables(cos=emb.cos().astype(dtype), sin=emb.sin().astype(dtype))
+    return RopeTables(cos=jnp.cos(emb).astype(dtype), sin=jnp.sin(emb).astype(dtype))
 
 
 def rotate_half(x: Array) -> Array:
