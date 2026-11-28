@@ -333,6 +333,8 @@ class ShardFetcher:
         with self._lock:
             for idx in indices:
                 self.corpus.evict_shard(split, idx)
+            if indices and hasattr(self.store, "purge_cache"):
+                self.store.purge_cache()
 
 
 def fetch_corpus_metadata(

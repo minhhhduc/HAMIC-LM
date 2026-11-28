@@ -67,6 +67,7 @@ class SessionLimits:
     eval_every_steps: int = 0
     eval_sequences: int | None = None
     checkpoint_at_end: bool = True
+    keep_last_checkpoints: int = 0
 
 
 @dataclass(frozen=True)
@@ -476,6 +477,7 @@ def run_session(
                         root,
                         source_commit,
                         _emit,
+                        keep_last_checkpoints=limits.keep_last_checkpoints,
                     )
                     if checkpoint is not None:
                         checkpoints.append(checkpoint)
@@ -516,6 +518,7 @@ def run_session(
             root,
             source_commit,
             log,
+            keep_last_checkpoints=limits.keep_last_checkpoints,
         )
         if checkpoint is not None:
             checkpoints.append(checkpoint)
@@ -663,6 +666,8 @@ def _persist(
     root: Path,
     source_commit: str,
     log: Callable[[str], None],
+    *,
+    keep_last_checkpoints: int = 0,
 ) -> str | None:
     t0 = time.monotonic()
     name = checkpoint_name(trainer.step)
@@ -695,9 +700,13 @@ def _persist(
             log(f"uploading checkpoint {name} ...")
             publisher.publish(local, metadata)
             log(f"published checkpoint {name} ({time.monotonic() - t0:.1f}s)")
-        for older in (root / "checkpoints").glob("step-*"):
-            if older != local and older.is_dir():
-                shutil.rmtree(older, ignore_errors=True)
+        for entry in (root / "checkpoints").glob("step-*"):
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+        if keep_last_checkpoints > 0:
+            pruned = publisher.prune(keep_last_checkpoints)
+            if pruned:
+                log(f"pruned {len(pruned)} old remote checkpoint(s): steps {pruned}")
     return str(local)
 
 

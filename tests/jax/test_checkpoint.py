@@ -135,3 +135,43 @@ def test_windowed_batches_resume_and_evict_across_windows(tmp_path: Path) -> Non
     np.testing.assert_array_equal(resumed.next_batch(), b3)
     np.testing.assert_array_equal(resumed.next_batch(), b4)
     assert b0.shape == (2, 4) and b1.shape == (2, 4)
+
+
+def test_checkpoint_publisher_prunes_oldest_remote_checkpoints(tmp_path: Path) -> None:
+    store = LocalObjectStore(tmp_path / "store")
+    prefix = "runs/prune-test"
+    publisher = CheckpointPublisher(store, prefix)
+    for step in (1, 2, 3):
+        local = tmp_path / f"local-{step}"
+        metadata = {"step": step, "backend": "jax"}
+        save_checkpoint(local, {"weight": np.full(2, step, dtype=np.float32)}, (), step, DataCursor(step), metadata)
+        publisher.publish(local, metadata)
+    pruned = publisher.prune(1)
+    assert pruned == [1, 2]
+    resolver = CheckpointResolver(store, prefix)
+    assert [item.step for item in resolver.committed()] == [3]
+    restored = tmp_path / "restored"
+    assert resolver.restore_latest(restored) is not None
+    loaded, _, step, _, _ = load_checkpoint(restored)
+    assert step == 3
+    np.testing.assert_array_equal(loaded["weight"], np.full(2, 3, dtype=np.float32))
+
+
+def test_evict_shards_purges_store_cache(tmp_path: Path) -> None:
+    from unittest.mock import MagicMock
+    from hamic_jax.data import ShardFetcher
+
+    corpus_dir = tmp_path / "corpus"
+    (corpus_dir / "train").mkdir(parents=True)
+    tok = corpus_dir / "train" / "train-00000.tokens.npy"
+    tok.write_bytes(b"abc")
+    (corpus_dir / MANIFEST_NAME).write_text(
+        '{"format": "hamic-tokenized-npy-v1", "splits": {"train": {"shards": [{"tokens": 1, "documents": 1, "files": {"tokens": {"path": "train-00000.tokens.npy", "sha256": "unused"}}}]}}}',
+        encoding="utf-8",
+    )
+    corpus = TokenizedCorpus(corpus_dir)
+    store = MagicMock()
+    fetcher = ShardFetcher(store, "tokenized/v/c", corpus)
+    fetcher.evict_shards("train", [0])
+    assert not tok.exists()
+    store.purge_cache.assert_called_once_with()

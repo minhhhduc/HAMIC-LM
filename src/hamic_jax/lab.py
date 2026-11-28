@@ -251,6 +251,7 @@ def run_training_session(
     handle_preemption: bool = False,
     fetcher: Any = None,
     show_progress: bool = False,
+    keep_last_checkpoints: int = 2,
 ) -> SessionReport:
     """Run or resume a real training session against the configured Hub store."""
     limits = SessionLimits(
@@ -261,6 +262,7 @@ def run_training_session(
         eval_every_steps=config.eval_every_steps,
         eval_sequences=config.eval_sequences,
         checkpoint_at_end=True,
+        keep_last_checkpoints=keep_last_checkpoints,
     )
     return run_session(
         config,

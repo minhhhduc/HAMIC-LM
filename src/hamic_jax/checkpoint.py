@@ -35,6 +35,7 @@ __all__ = [
     "LocalObjectStore",
     "ObjectStore",
     "checkpoint_name",
+    "clear_hf_download_cache",
     "load_checkpoint",
     "save_checkpoint",
 ]
@@ -311,6 +312,48 @@ class LocalObjectStore:
                 found[remote] = path.stat().st_size
         return found
 
+    def delete_prefix(self, prefix: str, message: str) -> None:
+        del message
+        clean = prefix.strip("/")
+        if not clean:
+            raise ValueError("refusing to delete empty prefix")
+        target = self._path(clean)
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.exists():
+            target.unlink(missing_ok=True)
+
+    def purge_cache(self) -> int:
+        """No external download cache exists for a local object store."""
+        return 0
+
+
+def clear_hf_download_cache() -> int:
+    """Delete Hugging Face Hub and Xet local caches and return reclaimed bytes."""
+    candidates: list[Path] = []
+    xet_cache = os.environ.get("HF_XET_CACHE")
+    if xet_cache:
+        candidates.append(Path(xet_cache))
+    hf_home = Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface")
+    candidates.append(hf_home / "xet")
+    candidates.append(Path(os.environ.get("HF_HUB_CACHE") or hf_home / "hub"))
+
+    seen: set[Path] = set()
+    freed = 0
+    for raw_path in candidates:
+        resolved = raw_path.expanduser().resolve()
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        for item in resolved.rglob("*"):
+            if item.is_file():
+                try:
+                    freed += item.stat().st_size
+                except OSError:
+                    pass
+        shutil.rmtree(resolved, ignore_errors=True)
+    return freed
+
 
 class HuggingFaceObjectStore:
     """A private Hugging Face repository used as an object store.
@@ -371,28 +414,34 @@ class HuggingFaceObjectStore:
         from huggingface_hub.errors import EntryNotFoundError, RemoteEntryNotFoundError
 
         try:
+            with tempfile.TemporaryDirectory(prefix=".hamic-hf-read-") as tmp:
+                path = hf_hub_download(
+                    self.repo_id,
+                    remote_path,
+                    repo_type=self.repo_type,
+                    token=self._token,
+                    local_dir=tmp,
+                    force_download=True,
+                )
+                return Path(path).read_bytes()
+        except (EntryNotFoundError, RemoteEntryNotFoundError):
+            return None
+
+    def download(self, remote_path: str, destination: Path) -> Path:
+        from huggingface_hub import hf_hub_download
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=f".{destination.name}-", dir=destination.parent
+        ) as tmp:
             path = hf_hub_download(
                 self.repo_id,
                 remote_path,
                 repo_type=self.repo_type,
                 token=self._token,
-                force_download=True,
+                local_dir=tmp,
             )
-        except (EntryNotFoundError, RemoteEntryNotFoundError):
-            return None
-        return Path(path).read_bytes()
-
-    def download(self, remote_path: str, destination: Path) -> Path:
-        from huggingface_hub import hf_hub_download
-
-        path = hf_hub_download(
-            self.repo_id,
-            remote_path,
-            repo_type=self.repo_type,
-            token=self._token,
-        )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(path, destination)
+            os.replace(Path(path), destination)
         return destination
 
     @staticmethod
@@ -649,6 +698,26 @@ class HuggingFaceObjectStore:
                 found[str(path)] = int(size)
         return found
 
+    def delete_prefix(self, prefix: str, message: str) -> None:
+        from huggingface_hub.errors import EntryNotFoundError, RemoteEntryNotFoundError
+
+        clean = prefix.strip("/")
+        if not clean:
+            raise ValueError("refusing to delete empty prefix")
+        try:
+            self._api.delete_folder(
+                path_in_repo=clean,
+                repo_id=self.repo_id,
+                repo_type=self.repo_type,
+                commit_message=message,
+            )
+        except (EntryNotFoundError, RemoteEntryNotFoundError):
+            pass
+
+    def purge_cache(self) -> int:
+        """Delete local Hugging Face Hub and Xet download caches."""
+        return clear_hf_download_cache()
+
 
 @dataclass(frozen=True)
 class RemoteCheckpoint:
@@ -707,6 +776,28 @@ class CheckpointPublisher:
             f"latest -> {name}",
         )
         return RemoteCheckpoint(prefix=prefix, metadata=dict(metadata))
+
+    def prune(self, keep_last: int) -> list[int]:
+        """Delete remote checkpoints older than the newest ``keep_last``."""
+        if keep_last <= 0 or not hasattr(self.store, "delete_prefix"):
+            return []
+        committed = CheckpointResolver(self.store, self.run_prefix).committed()
+        if len(committed) <= keep_last:
+            return []
+        latest_prefix: str | None = None
+        latest_raw = self.store.read_bytes(f"{self.run_prefix}/{LATEST_NAME}")
+        if latest_raw is not None:
+            latest_prefix = json.loads(latest_raw).get("checkpoint")
+        pruned: list[int] = []
+        for checkpoint in committed[:-keep_last]:
+            if checkpoint.prefix == latest_prefix:
+                continue
+            self.store.delete_prefix(
+                checkpoint.prefix,
+                f"prune checkpoint {Path(checkpoint.prefix).name}",
+            )
+            pruned.append(checkpoint.step)
+        return pruned
 
 
 class CheckpointResolver:
