@@ -528,6 +528,8 @@ def evaluate_metrics(
     masking: str | None = None,
     mask_rate: float | None = None,
     pmi_pairs: np.ndarray[Any, Any] | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
 ) -> tuple[float, float | None]:
     """Mean validation loss and, for causal LM, bits per byte.
 
@@ -642,7 +644,10 @@ def evaluate_metrics(
     losses: list[float] = []
     nats = 0.0
     target_bytes = 0.0
-    for index in range(max(1, math.ceil(count / batch))):
+    num_batches = max(1, math.ceil(count / batch))
+
+    def _run_batch(index: int) -> None:
+        nonlocal nats, target_bytes
         rows = batches.next_batch()
         masked = objective(rows, _EVAL_SEED_OFFSET + index)
         loss, batch_nats = jitted(
@@ -658,6 +663,24 @@ def evaluate_metrics(
             target_bytes += float(
                 np.sum(byte_table[np.where(valid, targets, 0)] * valid)
             )
+
+    if show_progress:
+        from tqdm import tqdm
+
+        with tqdm(
+            range(num_batches),
+            total=num_batches,
+            desc=progress_desc or "eval",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        ) as bar:
+            for index in bar:
+                _run_batch(index)
+                bar.set_postfix(loss=f"{float(np.mean(losses)):.4f}", refresh=False)
+    else:
+        for index in range(num_batches):
+            _run_batch(index)
     mean_loss = float(np.mean(losses)) if losses else float("nan")
     bits_per_byte = (
         nats / (math.log(2) * target_bytes)
@@ -678,6 +701,8 @@ def evaluate(
     masking: str | None = None,
     mask_rate: float | None = None,
     pmi_pairs: np.ndarray[Any, Any] | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
 ) -> float:
     """Mean validation loss over a deterministic prefix of the validation split."""
     loss, _ = evaluate_metrics(
@@ -690,6 +715,8 @@ def evaluate(
         masking=masking,
         mask_rate=mask_rate,
         pmi_pairs=pmi_pairs,
+        show_progress=show_progress,
+        progress_desc=progress_desc,
     )
     return loss
 
@@ -756,6 +783,7 @@ def evaluate_views(
     *,
     mask_rate: float | None = None,
     pmi_pairs: np.ndarray[Any, Any] | None = None,
+    show_progress: bool = False,
 ) -> dict[str, float]:
     """Evaluate the same parameters under each requested masking view."""
     mining = pmi_pairs
@@ -778,6 +806,8 @@ def evaluate_views(
             masking=view,
             mask_rate=mask_rate,
             pmi_pairs=mining,
+            show_progress=show_progress,
+            progress_desc=f"eval {view}",
         )
         for view in views
     }

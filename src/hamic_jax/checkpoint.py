@@ -411,15 +411,16 @@ class HuggingFaceObjectStore:
         from concurrent.futures import ThreadPoolExecutor
 
         from huggingface_hub import hf_hub_download
-        from tqdm.auto import tqdm as auto_tqdm
+        from tqdm import tqdm
 
         lock = threading.Lock()
         done_files = 0
-        bar = auto_tqdm(
+        bar = tqdm(
             total=total_bytes or len(remote_files),
             unit="B" if total_bytes else "file",
             unit_scale=bool(total_bytes),
             desc=desc,
+            dynamic_ncols=True,
         )
 
         class _AggregatedTqdm:

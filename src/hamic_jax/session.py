@@ -159,6 +159,7 @@ def run_session(
     log: Callable[[str], None] = print,
     handle_preemption: bool = False,
     fetcher: Any = None,
+    show_progress: bool = False,
 ) -> SessionReport:
     """Train until the step/time limit, resuming from the latest committed checkpoint.
 
@@ -351,7 +352,29 @@ def run_session(
         except (ValueError, OSError):
             warnings.append("SIGTERM handler unavailable; preemption will not checkpoint")
 
+    train_bar: Any = None
+
+    def _emit(message: str) -> None:
+        if train_bar is not None and log is print:
+            train_bar.write(message)
+        else:
+            log(message)
+
     try:
+        if show_progress:
+            from tqdm import tqdm
+
+            train_bar = tqdm(
+                total=target,
+                initial=trainer.step,
+                desc=f"train {config.run_id}",
+                unit="step",
+                dynamic_ncols=True,
+            )
+            train_bar.set_postfix_str("compiling...")
+        last_eval_loss: float | None = None
+        first_step = True
+
         with trainer.prefetch(depth=2):
             while trainer.step < target:
                 if stop["requested"]:
@@ -371,6 +394,8 @@ def run_session(
                         now - started,
                     )
                 )
+                if train_bar is not None:
+                    train_bar.update(1)
                 due_eval = bool(
                     limits.eval_every_steps
                     and trainer.step % limits.eval_every_steps == 0
@@ -393,20 +418,43 @@ def run_session(
                         corpus,
                         trainer.params,
                         sequences=limits.eval_sequences,
+                        show_progress=show_progress,
+                        progress_desc=f"eval step {trainer.step}",
                     )
                     current["eval_loss"] = eval_loss
+                    last_eval_loss = eval_loss
                     if eval_bpb is not None:
                         current["eval_bpb"] = eval_bpb
+                        _emit(
+                            f"eval step {trainer.step}/{target} "
+                            f"loss {eval_loss:.5f} bpb {eval_bpb:.4f}"
+                        )
+                    else:
+                        _emit(f"eval step {trainer.step}/{target} loss {eval_loss:.5f}")
                 if progress is not None:
                     assert current is not None
                     progress(trainer.step, target, float(current["loss"]))
                 if due_log:
                     assert current is not None
-                    log(
+                    _emit(
                         f"step {trainer.step}/{target} loss {current['loss']:.5f} "
                         f"lr {current['lr']:.3g} |g| {current['grad_norm']:.3f} "
                         f"tokens {current['tokens']}"
                     )
+                if train_bar is not None:
+                    if current is not None:
+                        postfix: dict[str, str] = {
+                            "loss": f"{current['loss']:.4f}",
+                            "lr": f"{current['lr']:.2e}",
+                        }
+                        if "tokens_per_second" in current:
+                            postfix["tok/s"] = f"{current['tokens_per_second']:,.0f}"
+                        if last_eval_loss is not None:
+                            postfix["eval"] = f"{last_eval_loss:.4f}"
+                        train_bar.set_postfix(postfix, refresh=False)
+                    elif first_step:
+                        train_bar.set_postfix_str("running", refresh=False)
+                first_step = False
                 now = time.monotonic()
                 due_steps = bool(
                     limits.checkpoint_every_steps
@@ -428,7 +476,7 @@ def run_session(
                         publisher,
                         root,
                         source_commit,
-                        log,
+                        _emit,
                     )
                     if checkpoint is not None:
                         checkpoints.append(checkpoint)
@@ -437,10 +485,13 @@ def run_session(
                         _publish_metrics(root, store, config.run_id, metrics, publish)
                         evicted = trainer.evict_completed_windows()
                         if evicted:
-                            log(f"evicted {len(evicted)} completed shard(s)")
+                            _emit(f"evicted {len(evicted)} completed shard(s)")
                 elif not publish and due_window:
                     trainer.evict_completed_windows()
     finally:
+        if train_bar is not None:
+            train_bar.close()
+            train_bar = None
         if previous_handler is not None:
             signal.signal(signal.SIGTERM, previous_handler)
     flush()
@@ -614,6 +665,7 @@ def _persist(
     source_commit: str,
     log: Callable[[str], None],
 ) -> str | None:
+    t0 = time.monotonic()
     name = checkpoint_name(trainer.step)
     local = root / "checkpoints" / name
     metadata = {
@@ -628,6 +680,7 @@ def _persist(
         "param_count": preset.num_parameters,
     }
     if not local.exists():
+        log(f"saving checkpoint {name} ...")
         save_checkpoint(
             local,
             trainer.params,
@@ -640,8 +693,9 @@ def _persist(
         remote = f"{publisher.run_prefix}/checkpoints/{name}/COMMITTED.json"
         assert store is not None
         if store.read_bytes(remote) is None:
+            log(f"uploading checkpoint {name} ...")
             publisher.publish(local, metadata)
-            log(f"published checkpoint {name}")
+            log(f"published checkpoint {name} ({time.monotonic() - t0:.1f}s)")
         for older in (root / "checkpoints").glob("step-*"):
             if older != local and older.is_dir():
                 shutil.rmtree(older, ignore_errors=True)

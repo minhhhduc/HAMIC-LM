@@ -162,6 +162,7 @@ def run_bench(
     source_commit: str = "",
     progress: Callable[[int, int, float], None] | None = None,
     log: Callable[[str], None] = print,
+    show_progress: bool = False,
 ) -> BenchResult:
     """Run a short local benchmark that can never resume or touch Hub runs."""
     if steps <= 0:
@@ -201,6 +202,7 @@ def run_bench(
         raw_config=asdict(bench_config),
         progress=progress,
         log=log,
+        show_progress=show_progress,
     )
     return BenchResult(config=bench_config, report=report)
 
@@ -248,6 +250,7 @@ def run_training_session(
     log: Callable[[str], None] = print,
     handle_preemption: bool = False,
     fetcher: Any = None,
+    show_progress: bool = False,
 ) -> SessionReport:
     """Run or resume a real training session against the configured Hub store."""
     limits = SessionLimits(
@@ -272,6 +275,7 @@ def run_training_session(
         log=log,
         handle_preemption=handle_preemption,
         fetcher=fetcher,
+        show_progress=show_progress,
     )
 
 
@@ -317,6 +321,7 @@ def evaluate_completed_run(
     views: Sequence[str],
     mask_rate: float,
     log: Callable[[str], None] = print,
+    show_progress: bool = False,
 ) -> list[EvaluationRow]:
     """Evaluate one finished run under the requested masking views."""
     if not record.complete:
@@ -345,6 +350,7 @@ def evaluate_completed_run(
         views=selected,
         sequences=sequences,
         mask_rate=mask_rate,
+        show_progress=show_progress,
     )
     return [
         EvaluationRow(

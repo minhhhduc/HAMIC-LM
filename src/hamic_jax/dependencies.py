@@ -18,6 +18,7 @@ _BASE = {
     "matplotlib": "matplotlib",
     "ipywidgets": "ipywidgets",
     "pandas": "pandas",
+    "tqdm": "tqdm",
 }
 _DOWNSTREAM = {
     "transformers": "transformers",
