@@ -372,11 +372,13 @@ class HuggingFaceObjectStore:
         sibling staging directory and atomically renames ``<staging>/<prefix>``
         to ``destination``.
         """
+        import threading
         from concurrent.futures import ThreadPoolExecutor
 
         from huggingface_hub import hf_hub_download
         from huggingface_hub.errors import EntryNotFoundError, RemoteEntryNotFoundError
         from huggingface_hub.hf_api import RepoFile
+        from tqdm.auto import tqdm as auto_tqdm
 
         if destination.exists():
             raise FileExistsError(f"Destination already exists: {destination}")
@@ -392,23 +394,76 @@ class HuggingFaceObjectStore:
                 revision=revision,
                 repo_type=self.repo_type,
             )
-            remote_files = sorted(
-                entry.path for entry in entries if isinstance(entry, RepoFile)
+            file_entries = sorted(
+                (entry for entry in entries if isinstance(entry, RepoFile)),
+                key=lambda entry: entry.path,
             )
         except (EntryNotFoundError, RemoteEntryNotFoundError) as exc:
             raise FileNotFoundError(
                 f"Nothing found under {prefix!r} in {self.repo_id}"
             ) from exc
-        if not remote_files:
+        if not file_entries:
             raise FileNotFoundError(
                 f"Nothing found under {prefix!r} in {self.repo_id}"
             )
+        remote_files = [entry.path for entry in file_entries]
+        total_bytes = sum(int(entry.size or 0) for entry in file_entries)
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(
             tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
         )
+        lock = threading.Lock()
+        done_files = 0
+        bar = auto_tqdm(
+            total=total_bytes or len(remote_files),
+            unit="B" if total_bytes else "file",
+            unit_scale=bool(total_bytes),
+            desc=f"Downloading {clean}",
+        )
+
+        class _AggregatedTqdm:
+            disabled = False
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def __enter__(self) -> _AggregatedTqdm:
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+            def refresh(self) -> None:
+                pass
+
+            def set_description(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def set_description_str(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def set_postfix_str(self, postfix: str = "", refresh: bool = False) -> None:
+                del postfix, refresh
+
+            def set_transfer_postfix_str(
+                self, postfix: str = "", refresh: bool = False
+            ) -> None:
+                del postfix, refresh
+
+            def update_transfer(self, n: int | float | None = 1) -> None:
+                del n
+
+            def update(self, n: int | float | None = 1) -> None:
+                if total_bytes and n:
+                    with lock:
+                        bar.update(n)
+
         try:
             def _fetch(remote_path: str) -> None:
+                nonlocal done_files
                 hf_hub_download(
                     self.repo_id,
                     filename=remote_path,
@@ -416,10 +471,21 @@ class HuggingFaceObjectStore:
                     revision=revision,
                     local_dir=staging,
                     token=self._token,
+                    tqdm_class=_AggregatedTqdm,
                 )
+                with lock:
+                    done_files += 1
+                    bar.set_postfix_str(
+                        f"{done_files}/{len(remote_files)} files", refresh=False
+                    )
+                    if not total_bytes:
+                        bar.update(1)
 
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                list(pool.map(_fetch, remote_files))
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    list(pool.map(_fetch, remote_files))
+            finally:
+                bar.close()
 
             source = staging / clean
             if not source.is_dir():
