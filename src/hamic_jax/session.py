@@ -158,6 +158,7 @@ def run_session(
     progress: Callable[[int, int, float], None] | None = None,
     log: Callable[[str], None] = print,
     handle_preemption: bool = False,
+    fetcher: Any = None,
 ) -> SessionReport:
     """Train until the step/time limit, resuming from the latest committed checkpoint.
 
@@ -228,8 +229,16 @@ def run_session(
                 already_complete=True,
             )
         publisher = CheckpointPublisher(store, prefix)
+        if config.objective == "mlm" and config.masking == "pmi":
+            local_pmi = corpus.root / "pmi_pairs.npy"
+            if not local_pmi.is_file() and store.read_bytes(f"{prefix}/pmi_pairs.npy") is not None:
+                store.download(f"{prefix}/pmi_pairs.npy", local_pmi)
 
-    trainer = Trainer(config, preset, corpus)
+    trainer = Trainer(config, preset, corpus, fetcher=fetcher)
+    if publish and store is not None and config.objective == "mlm" and config.masking == "pmi":
+        local_pmi = corpus.root / "pmi_pairs.npy"
+        if local_pmi.is_file() and store.read_bytes(f"{prefix}/pmi_pairs.npy") is None:
+            store.put_files({f"{prefix}/pmi_pairs.npy": local_pmi}, f"pmi pairs {config.run_id}")
     warnings: list[str] = []
     if publish:
         assert store is not None
@@ -407,7 +416,8 @@ def run_session(
                     limits.checkpoint_every_seconds
                     and now - last_checkpoint_time >= limits.checkpoint_every_seconds
                 )
-                if due_steps or due_time:
+                due_window = bool(getattr(trainer.batches, "has_completed_window", False))
+                if publish and (due_steps or due_time or due_window):
                     flush()
                     checkpoint = _persist(
                         trainer,
@@ -425,6 +435,11 @@ def run_session(
                         last_checkpoint_step = trainer.step
                         last_checkpoint_time = now
                         _publish_metrics(root, store, config.run_id, metrics, publish)
+                        evicted = trainer.evict_completed_windows()
+                        if evicted:
+                            log(f"evicted {len(evicted)} completed shard(s)")
+                elif not publish and due_window:
+                    trainer.evict_completed_windows()
     finally:
         if previous_handler is not None:
             signal.signal(signal.SIGTERM, previous_handler)
@@ -455,6 +470,7 @@ def run_session(
         if checkpoint is not None:
             checkpoints.append(checkpoint)
             last_checkpoint_step = trainer.step
+            trainer.evict_completed_windows()
     if publish:
         _publish_metrics(root, store, config.run_id, metrics, publish)
         assert store is not None

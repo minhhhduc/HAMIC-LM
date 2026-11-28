@@ -175,3 +175,18 @@ def test_sparse_mlm_loss_matches_dense_value_and_grad(sparse_capacity: int) -> N
             rtol=1e-5,
             atol=1e-6,
         )
+
+
+def test_modernbert_init_uses_truncated_normal_and_output_scaling() -> None:
+    import math
+
+    preset = _encoder()
+    params = init_params(preset, jax.random.PRNGKey(4))
+    std_in = 0.02
+    std_out = 0.02 / math.sqrt(2.0 * preset.num_layers)
+    cutoff = 2.0
+    assert float(jnp.max(jnp.abs(params["model.layers.0.attn.Wqkv.weight"]))) <= cutoff * std_in + 1e-6
+    assert float(jnp.max(jnp.abs(params["model.layers.0.attn.Wo.weight"]))) <= cutoff * std_out + 1e-6
+    assert float(jnp.std(params["model.layers.0.attn.Wo.weight"])) < float(
+        jnp.std(params["model.layers.0.attn.Wqkv.weight"])
+    )

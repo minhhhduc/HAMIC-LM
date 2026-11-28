@@ -240,6 +240,7 @@ class TrainingConfig:
     shuffle: bool = True
     deterministic: bool = False
     recompute: bool = True
+    shard_window: int = 0
 
     def __post_init__(self) -> None:
         if self.objective not in ("mlm", "clm"):
@@ -258,6 +259,8 @@ class TrainingConfig:
             raise ValueError("decay_ratio must be in (0, 1]")
         if self.seq_len <= 0 or self.micro_batch_size <= 0 or self.grad_accum_steps <= 0:
             raise ValueError("batch geometry must be positive")
+        if self.shard_window < 0:
+            raise ValueError("shard_window must be >= 0")
 
     @property
     def tokens_per_step(self) -> int:
@@ -276,7 +279,7 @@ class TrainingConfig:
 
     def identity(self) -> dict[str, Any]:
         """Fields that define the trajectory and therefore gate strict resume."""
-        return {
+        fields: dict[str, Any] = {
             "model_preset": self.model_preset,
             "objective": self.objective,
             "seq_len": self.seq_len,
@@ -316,6 +319,9 @@ class TrainingConfig:
             "whole_word_masking": self.whole_word_masking,
             "variant_share": self.variant_share,
         }
+        if self.shard_window:
+            fields["shard_window"] = self.shard_window
+        return fields
 
 
 _MODEL_KEYS = {
@@ -386,6 +392,7 @@ _TRAIN_KEYS = {
     "shuffle",
     "deterministic",
     "recompute",
+    "shard_window",
     "log_every_steps",
     "eval_every_steps",
     "eval_sequences",
@@ -532,4 +539,5 @@ def training_config_from_mapping(data: Mapping[str, Any]) -> TrainingConfig:
         shuffle=bool(data.get("shuffle", True)),
         deterministic=bool(data.get("deterministic", False)),
         recompute=bool(data.get("recompute", True)),
+        shard_window=int(data.get("shard_window", 0)),
     )

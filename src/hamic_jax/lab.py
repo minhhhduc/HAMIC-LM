@@ -247,6 +247,7 @@ def run_training_session(
     progress: Callable[[int, int, float], None] | None = None,
     log: Callable[[str], None] = print,
     handle_preemption: bool = False,
+    fetcher: Any = None,
 ) -> SessionReport:
     """Run or resume a real training session against the configured Hub store."""
     limits = SessionLimits(
@@ -270,6 +271,7 @@ def run_training_session(
         progress=progress,
         log=log,
         handle_preemption=handle_preemption,
+        fetcher=fetcher,
     )
 
 

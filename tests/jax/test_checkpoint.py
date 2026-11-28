@@ -14,7 +14,13 @@ from hamic_jax.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from hamic_jax.data import DataCursor
+from hamic_jax.data import (
+    MANIFEST_NAME,
+    DataCursor,
+    TokenizedCorpus,
+    WindowedPackedBatches,
+    fetch_corpus_metadata,
+)
 from hamic_jax.runs import write_run_manifest
 
 
@@ -58,3 +64,74 @@ def test_run_manifest_refuses_a_different_tokenized_corpus(tmp_path: Path) -> No
     write_run_manifest(store, manifest, "create run")
     with pytest.raises(RuntimeError, match="different tokenized corpus"):
         write_run_manifest(store, {**manifest, "corpus_sha256": "b"}, "resume run")
+
+
+def test_windowed_batches_resume_and_evict_across_windows(tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    remote_root = tmp_path / "remote"
+    prefix = "tokenized/test-win/tok"
+    src_dir = remote_root / prefix
+    (src_dir / "train").mkdir(parents=True)
+    shards_meta = []
+    for idx in range(3):
+        tokens = np.arange(10 + idx * 10, 18 + idx * 10, dtype=np.uint16)
+        offsets = np.array([0, 4, 8], dtype=np.int64)
+        t_path = src_dir / "train" / f"train-{idx:05d}.tokens.npy"
+        o_path = src_dir / "train" / f"train-{idx:05d}.offsets.npy"
+        np.save(t_path, tokens)
+        np.save(o_path, offsets)
+        shards_meta.append({
+            "tokens": int(tokens.size),
+            "documents": 2,
+            "files": {
+                "tokens": {
+                    "path": t_path.name,
+                    "sha256": hashlib.sha256(t_path.read_bytes()).hexdigest(),
+                },
+                "offsets": {
+                    "path": o_path.name,
+                    "sha256": hashlib.sha256(o_path.read_bytes()).hexdigest(),
+                },
+            },
+        })
+    (src_dir / MANIFEST_NAME).write_text(
+        json.dumps({
+            "format": "hamic-tokenized-npy-v1",
+            "splits": {"train": {"shards": shards_meta}},
+        }),
+        encoding="utf-8",
+    )
+
+    store = LocalObjectStore(remote_root)
+    local_dir = tmp_path / "local"
+    corpus, fetcher = fetch_corpus_metadata(store, prefix, local_dir)
+    assert not (local_dir / "train" / "train-00000.tokens.npy").exists()
+
+    batches = WindowedPackedBatches(
+        corpus, "train", seq_len=4, batch_size=2, bos_id=0, eos_id=2,
+        shard_window=1, fetcher=fetcher, seed=7,
+    )
+    b0 = batches.next_batch()
+    b1 = batches.next_batch()
+    cursor = batches.cursor()
+    b2 = batches.next_batch()
+    b3 = batches.next_batch()
+    b4 = batches.next_batch()
+    assert batches.has_completed_window
+    evicted = batches.evict_completed()
+    assert evicted
+    for idx in evicted:
+        assert not (local_dir / "train" / f"train-{idx:05d}.tokens.npy").exists()
+
+    resumed_dir = tmp_path / "resumed"
+    r_corpus, r_fetcher = fetch_corpus_metadata(store, prefix, resumed_dir)
+    resumed = WindowedPackedBatches(
+        r_corpus, "train", seq_len=4, batch_size=2, bos_id=0, eos_id=2,
+        shard_window=1, fetcher=r_fetcher, seed=7, cursor=cursor,
+    )
+    np.testing.assert_array_equal(resumed.next_batch(), b2)
+    np.testing.assert_array_equal(resumed.next_batch(), b3)
+    np.testing.assert_array_equal(resumed.next_batch(), b4)
+    assert b0.shape == (2, 4) and b1.shape == (2, 4)

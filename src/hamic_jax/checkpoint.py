@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
@@ -214,6 +215,18 @@ class ObjectStore(Protocol):
         """Download a directory prefix."""
         ...
 
+    def download_files(
+        self,
+        remote_paths: Sequence[str],
+        destination: Path,
+        max_workers: int = 8,
+        *,
+        strip_prefix: str = "",
+        desc: str = "Downloading",
+    ) -> list[Path]:
+        """Download selected objects into ``destination``."""
+        ...
+
     def list_files(self, prefix: str) -> list[str]:
         """List paths under a prefix."""
         ...
@@ -263,6 +276,26 @@ class LocalObjectStore:
             raise FileExistsError(destination)
         shutil.copytree(self._path(prefix), destination)
         return destination
+
+    def download_files(
+        self,
+        remote_paths: Sequence[str],
+        destination: Path,
+        max_workers: int = 8,
+        *,
+        strip_prefix: str = "",
+        desc: str = "Downloading",
+    ) -> list[Path]:
+        del max_workers, desc
+        prefix = strip_prefix.rstrip("/")
+        saved: list[Path] = []
+        for remote in remote_paths:
+            rel = remote[len(prefix) + 1 :] if prefix and remote.startswith(f"{prefix}/") else remote
+            target = destination / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self._path(remote), target)
+            saved.append(target)
+        return saved
 
     def list_files(self, prefix: str) -> list[str]:
         base = self._path(prefix) if prefix else self.root
@@ -362,63 +395,31 @@ class HuggingFaceObjectStore:
         shutil.copyfile(path, destination)
         return destination
 
-    def download_prefix(
-        self, prefix: str, destination: Path, max_workers: int = 8
-    ) -> Path:
-        """Download every file under ``prefix`` into ``destination``.
-
-        Lists the exact recursive tree under ``prefix`` rather than relying on
-        ``snapshot_download`` glob patterns, then downloads every file into a
-        sibling staging directory and atomically renames ``<staging>/<prefix>``
-        to ``destination``.
-        """
+    @staticmethod
+    def _parallel_hf_download(
+        repo_id: str,
+        repo_type: str,
+        revision: str,
+        token: str | None,
+        remote_files: Sequence[str],
+        total_bytes: int,
+        staging: Path,
+        max_workers: int,
+        desc: str,
+    ) -> None:
         import threading
         from concurrent.futures import ThreadPoolExecutor
 
         from huggingface_hub import hf_hub_download
-        from huggingface_hub.errors import EntryNotFoundError, RemoteEntryNotFoundError
-        from huggingface_hub.hf_api import RepoFile
         from tqdm.auto import tqdm as auto_tqdm
 
-        if destination.exists():
-            raise FileExistsError(f"Destination already exists: {destination}")
-        clean = prefix.rstrip("/")
-        revision = self._api.repo_info(
-            self.repo_id, repo_type=self.repo_type
-        ).sha
-        try:
-            entries = self._api.list_repo_tree(
-                self.repo_id,
-                path_in_repo=clean,
-                recursive=True,
-                revision=revision,
-                repo_type=self.repo_type,
-            )
-            file_entries = sorted(
-                (entry for entry in entries if isinstance(entry, RepoFile)),
-                key=lambda entry: entry.path,
-            )
-        except (EntryNotFoundError, RemoteEntryNotFoundError) as exc:
-            raise FileNotFoundError(
-                f"Nothing found under {prefix!r} in {self.repo_id}"
-            ) from exc
-        if not file_entries:
-            raise FileNotFoundError(
-                f"Nothing found under {prefix!r} in {self.repo_id}"
-            )
-        remote_files = [entry.path for entry in file_entries]
-        total_bytes = sum(int(entry.size or 0) for entry in file_entries)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        staging = Path(
-            tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
-        )
         lock = threading.Lock()
         done_files = 0
         bar = auto_tqdm(
             total=total_bytes or len(remote_files),
             unit="B" if total_bytes else "file",
             unit_scale=bool(total_bytes),
-            desc=f"Downloading {clean}",
+            desc=desc,
         )
 
         class _AggregatedTqdm:
@@ -461,31 +462,142 @@ class HuggingFaceObjectStore:
                     with lock:
                         bar.update(n)
 
-        try:
-            def _fetch(remote_path: str) -> None:
-                nonlocal done_files
-                hf_hub_download(
-                    self.repo_id,
-                    filename=remote_path,
-                    repo_type=self.repo_type,
-                    revision=revision,
-                    local_dir=staging,
-                    token=self._token,
-                    tqdm_class=_AggregatedTqdm,
+        def _fetch(remote_path: str) -> None:
+            nonlocal done_files
+            hf_hub_download(
+                repo_id,
+                filename=remote_path,
+                repo_type=repo_type,
+                revision=revision,
+                local_dir=staging,
+                token=token,
+                tqdm_class=_AggregatedTqdm,
+            )
+            with lock:
+                done_files += 1
+                bar.set_postfix_str(
+                    f"{done_files}/{len(remote_files)} files", refresh=False
                 )
-                with lock:
-                    done_files += 1
-                    bar.set_postfix_str(
-                        f"{done_files}/{len(remote_files)} files", refresh=False
-                    )
-                    if not total_bytes:
-                        bar.update(1)
+                if not total_bytes:
+                    bar.update(1)
 
-            try:
-                with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    list(pool.map(_fetch, remote_files))
-            finally:
-                bar.close()
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                list(pool.map(_fetch, remote_files))
+        finally:
+            bar.close()
+
+    def download_files(
+        self,
+        remote_paths: Sequence[str],
+        destination: Path,
+        max_workers: int = 8,
+        *,
+        strip_prefix: str = "",
+        desc: str = "Downloading",
+    ) -> list[Path]:
+        """Download selected remote paths in parallel with one aggregated progress bar."""
+        if not remote_paths:
+            return []
+        clean_strip = strip_prefix.rstrip("/")
+        revision = self._api.repo_info(
+            self.repo_id, repo_type=self.repo_type
+        ).sha
+        sizes = self.stat(list(remote_paths))
+        total_bytes = sum(sizes.values())
+        destination.mkdir(parents=True, exist_ok=True)
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
+        )
+        saved: list[Path] = []
+        try:
+            self._parallel_hf_download(
+                self.repo_id,
+                self.repo_type,
+                revision,
+                self._token,
+                list(remote_paths),
+                total_bytes,
+                staging,
+                max_workers,
+                desc,
+            )
+            for remote_path in remote_paths:
+                staged = staging / remote_path
+                if not staged.is_file():
+                    raise FileNotFoundError(
+                        f"Missing downloaded object {remote_path!r} in {self.repo_id}"
+                    )
+                rel = (
+                    remote_path[len(clean_strip) + 1 :]
+                    if clean_strip and remote_path.startswith(f"{clean_strip}/")
+                    else remote_path
+                )
+                target = destination / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(staged, target)
+                saved.append(target)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        return saved
+
+    def download_prefix(
+        self, prefix: str, destination: Path, max_workers: int = 8
+    ) -> Path:
+        """Download every file under ``prefix`` into ``destination``.
+
+        Lists the exact recursive tree under ``prefix`` rather than relying on
+        ``snapshot_download`` glob patterns, then downloads every file into a
+        sibling staging directory and atomically renames ``<staging>/<prefix>``
+        to ``destination``.
+        """
+        from huggingface_hub.errors import EntryNotFoundError, RemoteEntryNotFoundError
+        from huggingface_hub.hf_api import RepoFile
+
+        if destination.exists():
+            raise FileExistsError(f"Destination already exists: {destination}")
+        clean = prefix.rstrip("/")
+        revision = self._api.repo_info(
+            self.repo_id, repo_type=self.repo_type
+        ).sha
+        try:
+            entries = self._api.list_repo_tree(
+                self.repo_id,
+                path_in_repo=clean,
+                recursive=True,
+                revision=revision,
+                repo_type=self.repo_type,
+            )
+            file_entries = sorted(
+                (entry for entry in entries if isinstance(entry, RepoFile)),
+                key=lambda entry: entry.path,
+            )
+        except (EntryNotFoundError, RemoteEntryNotFoundError) as exc:
+            raise FileNotFoundError(
+                f"Nothing found under {prefix!r} in {self.repo_id}"
+            ) from exc
+        if not file_entries:
+            raise FileNotFoundError(
+                f"Nothing found under {prefix!r} in {self.repo_id}"
+            )
+        remote_files = [entry.path for entry in file_entries]
+        total_bytes = sum(int(entry.size or 0) for entry in file_entries)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
+        )
+        try:
+            self._parallel_hf_download(
+                self.repo_id,
+                self.repo_type,
+                revision,
+                self._token,
+                remote_files,
+                total_bytes,
+                staging,
+                max_workers,
+                f"Downloading {clean}",
+            )
 
             source = staging / clean
             if not source.is_dir():

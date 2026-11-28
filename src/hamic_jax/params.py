@@ -114,14 +114,26 @@ def init_params(
     checkpoint.
     """
     leaves: dict[str, Array] = {}
+    is_modernbert = preset.architecture == Architecture.MODERNBERT
+    cutoff = 2.0
+    std_in = 0.02
+    std_out = std_in / math.sqrt(2.0 * preset.num_layers)
     for index, (name, shape) in enumerate(parameter_shapes(preset).items()):
         leaf_key = jax.random.fold_in(key, index)
         if name.endswith("bias"):
             value = jnp.zeros(shape, dtype=dtype)
         elif len(shape) == 1:
             value = jnp.ones(shape, dtype=dtype)
+        elif is_modernbert:
+            std = std_out if name.endswith((".Wo.weight", "head.dense.weight")) else std_in
+            value = (
+                jax.random.truncated_normal(
+                    leaf_key, lower=-cutoff, upper=cutoff, shape=shape, dtype=jnp.float32
+                )
+                * std
+            ).astype(dtype)
         else:
-            value = jax.random.normal(leaf_key, shape, dtype=jnp.float32) * 0.02
+            value = jax.random.normal(leaf_key, shape, dtype=jnp.float32) * std_in
             value = value.astype(dtype)
         leaves[name] = value
     return leaves

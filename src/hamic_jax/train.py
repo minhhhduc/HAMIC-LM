@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from hamic_jax.data import PackedBatches, TokenizedCorpus
+from hamic_jax.data import PackedBatches, ShardFetcher, TokenizedCorpus, WindowedPackedBatches
 from hamic_jax.model import forward, loss as model_loss
 from hamic_jax.objectives import CLMObjective, MLMObjective, MaskedBatch
 from hamic_jax.optim import build_optimizer
@@ -62,6 +62,7 @@ class Trainer:
         params: dict[str, Array] | None = None,
         seed: int | None = None,
         dtype: Any | None = None,
+        fetcher: ShardFetcher | None = None,
     ) -> None:
         if (
             not config.cross_document_attention
@@ -78,22 +79,39 @@ class Trainer:
         self.config = config
         self.preset = preset
         self._corpus = corpus
+        self._fetcher = fetcher
         self._seed = config.seed if seed is None else seed
         self._prefetch_queue: queue.Queue[Any] | None = None
         self.dtype = dtype if dtype is not None else (
             jnp.bfloat16 if config.precision == "bf16" else jnp.float32
         )
-        self.batches = PackedBatches(
-            corpus,
-            "train",
-            seq_len=config.seq_len,
-            batch_size=config.micro_batch_size,
-            bos_id=preset.special_tokens.bos_id,
-            eos_id=preset.special_tokens.eos_id,
-            seed=self._seed,
-            shuffle=config.shuffle,
-            source_weights=dict(config.source_weights) or None,
-        )
+        self.batches: PackedBatches | WindowedPackedBatches
+        if config.shard_window > 0:
+            self.batches = WindowedPackedBatches(
+                corpus,
+                "train",
+                seq_len=config.seq_len,
+                batch_size=config.micro_batch_size,
+                bos_id=preset.special_tokens.bos_id,
+                eos_id=preset.special_tokens.eos_id,
+                shard_window=config.shard_window,
+                fetcher=fetcher,
+                seed=self._seed,
+                shuffle=config.shuffle,
+                source_weights=dict(config.source_weights) or None,
+            )
+        else:
+            self.batches = PackedBatches(
+                corpus,
+                "train",
+                seq_len=config.seq_len,
+                batch_size=config.micro_batch_size,
+                bos_id=preset.special_tokens.bos_id,
+                eos_id=preset.special_tokens.eos_id,
+                seed=self._seed,
+                shuffle=config.shuffle,
+                source_weights=dict(config.source_weights) or None,
+            )
         self.layout = DeviceLayout.for_batch(config.micro_batch_size)
         key = jax.random.PRNGKey(config.seed)
         master = init_params(preset, key, dtype=jnp.float32) if params is None else params
@@ -118,14 +136,27 @@ class Trainer:
             pairs = None
             ngrams = None
             classes: TokenClasses | None = None
-            cache = Path(config.tokenized)
+            cache = corpus.root
+            def _mine_documents() -> tuple[Iterator[np.ndarray[Any, Any]], list[int]]:
+                if fetcher is not None:
+                    indices = fetcher.ensure_tokens("train", config.pmi_max_tokens)
+                    docs = (
+                        shard.document(doc_idx)
+                        for shard_idx in indices
+                        for shard in (corpus.load_shard("train", shard_idx),)
+                        for doc_idx in range(len(shard))
+                    )
+                    return docs, indices
+                return corpus.documents("train"), []
+
             if config.masking == "pmi":
                 pairs_file = cache / "pmi_pairs.npy"
                 if pairs_file.is_file():
                     pairs = np.load(pairs_file)
                 else:
+                    docs, mined_indices = _mine_documents()
                     pairs = mine_pmi_pairs(
-                        corpus.documents("train"),
+                        docs,
                         preset.vocab_size,
                         preset.special_tokens.special_ids,
                         max_tokens=config.pmi_max_tokens,
@@ -135,6 +166,9 @@ class Trainer:
                         eligible=word_tokens(corpus.tokenizer_file()),
                         discount_k=config.pmi_discount_k,
                     )
+                    np.save(pairs_file, pairs)
+                    if fetcher is not None and mined_indices:
+                        fetcher.evict_shards("train", mined_indices)
             if config.masking == "pmi_ngram":
                 classes = TokenClasses.from_tokenizer_file(corpus.tokenizer_file())
                 stem = (
@@ -142,11 +176,12 @@ class Trainer:
                     f"-{config.pmi_min_doc_count}-{config.pmi_min_pmi:g}"
                 )
                 ngram_file = cache / f"{stem}.npz"
-                ngrams = (
-                    NgramTables.load(ngram_file)
-                    if ngram_file.is_file()
-                    else mine_pmi_ngrams(
-                        corpus.documents("train"),
+                if ngram_file.is_file():
+                    ngrams = NgramTables.load(ngram_file)
+                else:
+                    docs, mined_indices = _mine_documents()
+                    ngrams = mine_pmi_ngrams(
+                        docs,
                         preset.vocab_size,
                         preset.special_tokens.special_ids,
                         classes=classes,
@@ -159,7 +194,9 @@ class Trainer:
                         discount_k=config.pmi_discount_k,
                         max_extension_share=config.pmi_max_extension_share,
                     )
-                )
+                    ngrams.save(ngram_file)
+                    if fetcher is not None and mined_indices:
+                        fetcher.evict_shards("train", mined_indices)
             if config.whole_word_masking and classes is None:
                 classes = TokenClasses.from_tokenizer_file(corpus.tokenizer_file())
             self.objective = MLMObjective(
@@ -309,18 +346,35 @@ class Trainer:
             return
         q: queue.Queue[Any] = queue.Queue(maxsize=depth)
         stop = threading.Event()
-        worker_batches = PackedBatches(
-            self._corpus,
-            "train",
-            seq_len=self.config.seq_len,
-            batch_size=self.config.micro_batch_size,
-            bos_id=self.preset.special_tokens.bos_id,
-            eos_id=self.preset.special_tokens.eos_id,
-            seed=self._seed,
-            shuffle=self.config.shuffle,
-            cursor=self.batches.cursor(),
-            source_weights=dict(self.config.source_weights) or None,
-        )
+        worker_batches: PackedBatches | WindowedPackedBatches
+        if isinstance(self.batches, WindowedPackedBatches):
+            worker_batches = WindowedPackedBatches(
+                self._corpus,
+                "train",
+                seq_len=self.config.seq_len,
+                batch_size=self.config.micro_batch_size,
+                bos_id=self.preset.special_tokens.bos_id,
+                eos_id=self.preset.special_tokens.eos_id,
+                shard_window=self.batches.shard_window,
+                fetcher=self._fetcher,
+                seed=self._seed,
+                shuffle=self.config.shuffle,
+                cursor=self.batches.cursor(),
+                source_weights=dict(self.config.source_weights) or None,
+            )
+        else:
+            worker_batches = PackedBatches(
+                self._corpus,
+                "train",
+                seq_len=self.config.seq_len,
+                batch_size=self.config.micro_batch_size,
+                bos_id=self.preset.special_tokens.bos_id,
+                eos_id=self.preset.special_tokens.eos_id,
+                seed=self._seed,
+                shuffle=self.config.shuffle,
+                cursor=self.batches.cursor(),
+                source_weights=dict(self.config.source_weights) or None,
+            )
         start_step = self.step
 
         def _produce() -> None:
@@ -381,6 +435,20 @@ class Trainer:
             if item[0] == "error":
                 raise item[1]
             _, placed_ids, placed_labels, next_cursor = item
+            if isinstance(self.batches, WindowedPackedBatches):
+                prev = (self.batches.epoch, self.batches.window)
+                curr = (next_cursor.epoch, next_cursor.window)
+                while prev != curr:
+                    self.batches._completed_shards.append(
+                        self.batches.window_indices(*prev)
+                    )
+                    ep, win = prev
+                    win += 1
+                    if win >= self.batches.num_windows:
+                        ep += 1
+                        win = 0
+                    prev = (ep, win)
+                self.batches.window = next_cursor.window
             self.batches.epoch = next_cursor.epoch
             self.batches.position = next_cursor.offset
             self.batches.token_offset = next_cursor.token_offset
@@ -399,6 +467,12 @@ class Trainer:
         self.optimizer_state = new_optimizer_state
         self.step += 1
         return loss, norm
+
+    def evict_completed_windows(self) -> list[int]:
+        """Delete local shards from finished windows after a committed checkpoint."""
+        if isinstance(self.batches, WindowedPackedBatches):
+            return self.batches.evict_completed()
+        return []
 
     def train_step(self) -> Array:
         """Run one optimizer step and return its mean loss as a device scalar."""
@@ -469,16 +543,30 @@ def evaluate_metrics(
     count = sequences or config.eval_sequences
     batch = batch_size or config.micro_batch_size
     layout = DeviceLayout.for_batch(batch)
-    batches = PackedBatches(
-        corpus,
-        "validation",
-        seq_len=config.seq_len,
-        batch_size=batch,
-        bos_id=preset.special_tokens.bos_id,
-        eos_id=preset.special_tokens.eos_id,
-        seed=config.seed,
-        shuffle=False,
-    )
+    batches: PackedBatches | WindowedPackedBatches
+    if config.shard_window > 0:
+        batches = WindowedPackedBatches(
+            corpus,
+            "validation",
+            seq_len=config.seq_len,
+            batch_size=batch,
+            bos_id=preset.special_tokens.bos_id,
+            eos_id=preset.special_tokens.eos_id,
+            shard_window=1,
+            seed=config.seed,
+            shuffle=False,
+        )
+    else:
+        batches = PackedBatches(
+            corpus,
+            "validation",
+            seq_len=config.seq_len,
+            batch_size=batch,
+            bos_id=preset.special_tokens.bos_id,
+            eos_id=preset.special_tokens.eos_id,
+            seed=config.seed,
+            shuffle=False,
+        )
     objective: Any
     if config.objective == "mlm":
         view = masking or "token"
